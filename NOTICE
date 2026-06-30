@@ -1,0 +1,6 @@
+Seestar for Home Assistant
+Copyright 2026 Brian R. Jackson
+Licensed under the Apache License, Version 2.0.
+
+Bundles seestar_alp (https://github.com/smart-underworld/seestar_alp), GPL-3.0,
+with its component licenses (MIT AlpacaDevice, BSD-3 PyIndi) preserved in the image.
