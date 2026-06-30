@@ -1,0 +1,180 @@
+# Starter Lovelace dashboard for Seestar for Home Assistant.
+#
+# Copy this into a new dashboard (Settings -> Dashboards -> + -> "Edit in YAML"),
+# or paste individual cards into an existing view.
+#
+# ── IMPORTANT: the entity IDs below are NAME-DERIVED ──────────────────────────
+# Home Assistant builds each entity_id from the entity's NAME, not from the MQTT
+# discovery object_id. The bridge names every entity "<Scope name> <Entity>"
+# (e.g. "Seestar S30 Pro Telephoto target"), so the entity_id becomes
+#   sensor.<scope-name-slug>_<entity>   e.g. sensor.seestar_s30_pro_telephoto_target
+#
+# This file is written for a scope named **"Seestar S30 Pro"**, giving the prefix
+# **seestar_s30_pro**. If your scope has a different name, the prefix differs:
+#   "Backyard Seestar"      -> sensor.backyard_seestar_*
+#   "Observatory Seestar"   -> sensor.observatory_seestar_*
+#
+# To adapt this dashboard:
+#   1. Find your prefix: slug your scope name (lowercase; every run of
+#      non-alphanumeric characters becomes a single "_").
+#   2. Replace every "seestar_s30_pro" below with your prefix
+#      (a find-and-replace does it).
+#   3. CONFIRM the exact IDs on the device page: Settings -> Devices & Services ->
+#      Devices -> your Seestar. Each entity row shows its real entity_id. If HA
+#      had to de-duplicate a name it may have appended "_2"; only the device page
+#      shows the truth. Do not assume the IDs from this file are correct.
+#
+# Every card below maps to an entity the bridge actually publishes.
+title: Stargazing
+views:
+  - title: Seestar
+    path: seestar
+    icon: mdi:telescope
+    cards:
+      - type: picture-entity
+        # The live stacked-image preview camera. Its name is "Live stacked preview",
+        # so the entity_id is camera.<prefix>_live_stacked_preview.
+        entity: camera.seestar_s30_pro_live_stacked_preview
+        name: Live stacked preview
+        show_state: false
+        show_name: true
+        camera_view: auto
+
+      - type: glance
+        title: Now imaging
+        show_state: true
+        columns: 4
+        entities:
+          - entity: sensor.seestar_s30_pro_active_camera
+            name: Camera
+          - entity: sensor.seestar_s30_pro_telephoto_target
+            name: Target
+          - entity: sensor.seestar_s30_pro_stacked_frames
+            name: Stacked
+          - entity: sensor.seestar_s30_pro_integration_time
+            name: Integration
+
+      - type: entities
+        title: Telephoto camera (cam 0)
+        show_header_toggle: false
+        entities:
+          - entity: sensor.seestar_s30_pro_telephoto_target
+            name: Target
+          - entity: sensor.seestar_s30_pro_telephoto_state
+            name: State
+          - entity: sensor.seestar_s30_pro_telephoto_mode
+            name: Mode
+          - entity: sensor.seestar_s30_pro_telephoto_gain
+            name: Gain
+          - entity: binary_sensor.seestar_s30_pro_telephoto_lp_filter
+            name: LP filter
+
+      - type: entities
+        title: Wide-field camera (cam 1)
+        show_header_toggle: false
+        entities:
+          - entity: sensor.seestar_s30_pro_wide_field_target
+            name: Target
+          - entity: sensor.seestar_s30_pro_wide_field_state
+            name: State
+          - entity: sensor.seestar_s30_pro_wide_field_mode
+            name: Mode
+          - entity: sensor.seestar_s30_pro_wide_field_gain
+            name: Gain
+          - entity: binary_sensor.seestar_s30_pro_wide_field_lp_filter
+            name: LP filter
+
+      - type: entities
+        title: Stacking
+        show_header_toggle: false
+        entities:
+          - entity: sensor.seestar_s30_pro_stack_state
+            name: Stack state
+          - entity: sensor.seestar_s30_pro_stacked_frames
+            name: Stacked frames
+          - entity: sensor.seestar_s30_pro_dropped_frames
+            name: Dropped frames
+          - entity: sensor.seestar_s30_pro_total_frames
+            name: Total frames
+          - entity: sensor.seestar_s30_pro_exposure
+            name: Exposure
+          - entity: sensor.seestar_s30_pro_integration_time
+            name: Integration time
+
+      - type: entities
+        title: Plate solve
+        show_header_toggle: false
+        entities:
+          - entity: sensor.seestar_s30_pro_right_ascension
+            name: Right ascension
+          - entity: sensor.seestar_s30_pro_declination
+            name: Declination
+          - entity: sensor.seestar_s30_pro_field_of_view
+            name: Field of view
+          - entity: sensor.seestar_s30_pro_field_rotation
+            name: Field rotation
+          - entity: sensor.seestar_s30_pro_focal_length
+            name: Focal length
+          - entity: sensor.seestar_s30_pro_stars_detected
+            name: Stars detected
+
+      - type: entities
+        title: Plan & objects
+        show_header_toggle: false
+        entities:
+          - entity: sensor.seestar_s30_pro_plan
+            name: Plan
+          - entity: binary_sensor.seestar_s30_pro_plan_running
+            name: Plan running
+          - entity: sensor.seestar_s30_pro_objects_in_frame
+            name: Objects in frame
+          - entity: sensor.seestar_s30_pro_catalog_objects
+            name: Catalog objects
+          - entity: sensor.seestar_s30_pro_last_saved_file
+            name: Last saved file
+
+      - type: entities
+        title: Pointing & mount
+        show_header_toggle: false
+        entities:
+          - entity: sensor.seestar_s30_pro_altitude
+            name: Altitude
+          - entity: sensor.seestar_s30_pro_azimuth
+            name: Azimuth
+          - entity: binary_sensor.seestar_s30_pro_tracking
+            name: Tracking
+          - entity: binary_sensor.seestar_s30_pro_slewing
+            name: Slewing
+          - entity: sensor.seestar_s30_pro_goto_state
+            name: Goto state
+          - entity: binary_sensor.seestar_s30_pro_parked
+            name: Parked
+          - entity: binary_sensor.seestar_s30_pro_at_home
+            name: At home
+          - entity: sensor.seestar_s30_pro_mount_mode
+            name: Mount mode
+          - entity: sensor.seestar_s30_pro_focuser_position
+            name: Focuser position
+          - entity: sensor.seestar_s30_pro_filter_position
+            name: Filter position
+
+      - type: entities
+        title: Health & system
+        show_header_toggle: false
+        entities:
+          - entity: binary_sensor.seestar_s30_pro_connected
+            name: Connected
+          - entity: sensor.seestar_s30_pro_sensor_temperature
+            name: Sensor temperature
+          - entity: sensor.seestar_s30_pro_battery
+            name: Battery
+          - entity: sensor.seestar_s30_pro_charger
+            name: Charger
+          - entity: binary_sensor.seestar_s30_pro_dew_heater
+            name: Dew heater
+          - entity: sensor.seestar_s30_pro_storage_used
+            name: Storage used
+          - entity: sensor.seestar_s30_pro_firmware
+            name: Firmware
+          - entity: sensor.seestar_s30_pro_last_alert
+            name: Last alert
