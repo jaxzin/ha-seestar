@@ -5,8 +5,10 @@
 #
 # ── IMPORTANT: the entity IDs below are NAME-DERIVED ──────────────────────────
 # Home Assistant builds each entity_id from the entity's NAME, not from the MQTT
-# discovery object_id. The bridge names every entity "<Scope name> <Entity>"
-# (e.g. "Seestar S30 Pro Telephoto target"), so the entity_id becomes
+# discovery object_id. The bridge sets only the per-entity name (e.g. "Telephoto
+# target"); Home Assistant prepends the device name to form "<Scope name>
+# <Entity>" (e.g. "Seestar S30 Pro Telephoto target") and slugs THAT into the
+# entity_id:
 #   sensor.<scope-name-slug>_<entity>   e.g. sensor.seestar_s30_pro_telephoto_target
 #
 # This file is written for a scope named **"Seestar S30 Pro"**, giving the prefix

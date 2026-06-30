@@ -106,14 +106,43 @@ For **Home Assistant Container / Core** or a **separate host**, the repo ships a
 [`docker-compose.yml`](../docker-compose.yml) that runs the same bridge (and, in
 bundled mode, seestar_alp) from the same image. There is no Supervisor there, so:
 
-- **MQTT must be provided explicitly** via `MQTT_HOST` / `MQTT_PORT` /
+- **MQTT must be provided explicitly** via the `MQTT_HOST` / `MQTT_PORT` /
   `MQTT_USERNAME` / `MQTT_PASSWORD` / `MQTT_SSL` environment variables (there is
-  no Mosquitto add-on to borrow).
+  no Mosquitto add-on to borrow). These are the **only** environment variables
+  the bridge reads ([sample `.env`](../examples/env.sample)).
 - **Scopes** are configured in seestar_alp directly: in bundled mode via a
   bind-mounted `config.toml` ([sample](../examples/config.toml.sample)); in
   external mode by pointing `alpaca_host` at your existing instance.
-- The bridge's non-MQTT options come from a mounted `/data/options.json`
-  ([sample](../examples/options.json.sample)).
+- The bridge's **non-MQTT options live in `/data/options.json`**
+  ([sample](../examples/options.json.sample)) — `alpaca_host`,
+  `alpaca_webui_port`, and the tuning knobs are set there, **not** as environment
+  variables.
+
+> **Create the bind-mount source files before the first `docker compose up`.**
+> Copy them from `examples/`:
+>
+> ```
+> cp examples/config.toml.sample   ./config.toml
+> cp examples/options.json.sample  ./options.json
+> cp examples/env.sample           ./.env   # then edit MQTT_* + ARCH
+> ```
+>
+> A bind-mount whose source path is missing is created by Docker as an empty
+> **directory**, which silently breaks the container (the process tries to read a
+> directory as its config file). Create the files first.
+
+> **`aarch64` hosts must set `ARCH`.** The image is published per-arch and `ARCH`
+> defaults to `amd64`. On 64-bit ARM (e.g. a dedicated Raspberry Pi) set
+> `ARCH=aarch64` in `.env` (see [sample](../examples/env.sample)) or you will pull
+> the amd64 image and it won't run.
+
+Under compose, even the **bundled** setup runs the bridge in *external* mode:
+`options.json` sets `alpaca_host: "seestar_alp:5555"`, so the bridge resolves each
+scope's preview address from the **seestar_alp** service's `/config.json` (or the
+`/config` HTML page on the pinned `v3.2.2`) web UI on port **5432** — which is why
+the `seestar_alp` service publishes `5432`. It does **not** read the bind-mounted
+`config.toml` for the preview address (only seestar_alp reads `config.toml`).
+Telemetry is unaffected — it never needs the preview address.
 
 The compose file is commented top-to-bottom with the bundled-vs-external choice.
 
@@ -122,8 +151,10 @@ The compose file is commented top-to-bottom with the bundled-vs-external choice.
 ### Entity IDs are derived from the entity NAME, not the discovery ID
 
 Home Assistant builds each `entity_id` from the entity's **name**, ignoring the
-MQTT discovery `object_id`. The bridge names entities `<Scope name> <Entity>`, so
-for a scope named **"Seestar S30 Pro"** the IDs look like
+MQTT discovery `object_id`. The bridge sets only the per-entity name (e.g.
+`Telephoto target`); Home Assistant then prepends the device name to form the
+friendly name `<device name> <entity name>` and slugs *that* into the
+`entity_id`. So for a scope named **"Seestar S30 Pro"** the IDs come out as
 `sensor.seestar_s30_pro_telephoto_target`. With a different scope name the prefix
 differs (`"Backyard Seestar"` → `sensor.backyard_seestar_*`).
 
@@ -172,13 +203,14 @@ These are deliberate v1 limitations, documented so they don't surprise you:
    ingress surfaces the *bundled* seestar_alp SSC web UI. In **external** mode the
    app does not start a driver, so there is no UI to ingress — open your own
    seestar_alp instance's web UI directly.
+
+   <a id="renaming-a-scope-creates-a-new-device"></a>
+
 5. **A scope's name is identity-bearing.** The HA device id is derived from the
    scope name, and HA derives entity IDs from it too, so **renaming a scope
    creates a new device with new entity IDs** — the old ones go stale. Pick a
    stable name up front; if you must rename, expect to re-point dashboards and
    automations at the new IDs.
-
-   <a id="renaming-a-scope-creates-a-new-device"></a>
 
 ## Licensing
 
