@@ -1,0 +1,15 @@
+{
+  "_comment": "Bridge options for the docker-compose path. Copy to ./options.json (next to docker-compose.yml) and edit. These are the SAME keys as the HA app options EXCEPT MQTT, which compose passes via MQTT_* environment variables instead (no Supervisor to resolve it). The keys here are read by seestar_bridge.settings.load_settings; mqtt_* are intentionally omitted so the MQTT_* env wins.",
+
+  "_comment_alpaca_host": "REQUIRED in compose. In BUNDLED mode point it at the seestar_alp service by container name; in EXTERNAL mode point it at your own seestar_alp. The bridge enumerates scopes from here, so the scope list lives in seestar_alp's config.toml, not here.",
+  "alpaca_host": "seestar_alp:5555",
+
+  "_comment_alpaca_webui_port": "The seestar_alp web-UI port the bridge reads /config.json (or the /config HTML page) from for the preview address. Default 5432.",
+  "alpaca_webui_port": 5432,
+
+  "discovery_prefix": "homeassistant",
+  "event_poll_sec": 10,
+  "state_poll_sec": 30,
+  "preview_max_px": 1280,
+  "log_level": "info"
+}

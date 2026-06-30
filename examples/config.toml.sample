@@ -1,0 +1,33 @@
+# seestar_alp config for the docker-compose BUNDLED mode.
+#
+# Copy to ./config.toml (next to docker-compose.yml) and edit the [[seestars]]
+# block(s) for your telescope(s). In the HA app this file is generated for you by
+# the s6 init from the `scopes` option; under compose there is no Supervisor, so
+# you provide it directly. seestar_alp reads it from
+# /app/seestar_alp/device/config.toml (the compose bind-mount target).
+
+[network]
+ip_address = '0.0.0.0'   # bind all interfaces so the bridge reaches Alpaca by container DNS
+port = 5555              # ASCOM Alpaca API (internal to seestar-net)
+imgport = 7556           # imaging API (published)
+
+[webui_settings]
+uiport = 5432            # SSC web UI (published)
+
+[logging]
+log_to_stdout = true     # surface driver logs to `docker logs`
+log_level = 'INFO'       # match the bridge's log_level (use DEBUG to diagnose)
+
+# One [[seestars]] block per telescope. The name becomes the HA device name (and
+# its slug is the stable HA device id), and ip_address is the scope's LAN address.
+# device_num is 1-based and is the Alpaca DeviceNumber the bridge enumerates.
+[[seestars]]
+name = "Backyard Seestar"
+ip_address = "192.168.1.50"
+device_num = 1
+
+# Add more scopes by copying the block and bumping device_num:
+# [[seestars]]
+# name = "Observatory Seestar"
+# ip_address = "192.168.1.51"
+# device_num = 2

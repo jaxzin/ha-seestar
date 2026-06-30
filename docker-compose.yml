@@ -1,0 +1,111 @@
+# Seestar for Home Assistant — Docker Compose path (for installs WITHOUT the HA
+# Supervisor: Home Assistant Container, Home Assistant Core, or a dedicated box
+# such as a separate Raspberry Pi).
+#
+# This runs the SAME artifacts as the HA app — the seestar_bridge telemetry
+# publisher and (in bundled mode) the seestar_alp Alpaca driver — out of the same
+# multi-arch image published to GHCR. The only difference is the entrypoint: the
+# app image's s6/bashio init resolves MQTT and renders config.toml via the
+# Supervisor API, which does NOT exist here, so each service is launched directly
+# and configured through environment + mounted files instead.
+#
+#   docker compose up -d            # pull the prebuilt image and start
+#   docker compose up -d --build    # build the image locally instead (see `build:`)
+#   docker compose logs -f bridge   # watch MQTT discovery + connection
+#   docker compose down             # stop
+#
+# ---------------------------------------------------------------------------
+# REQUIRED CONFIG (no Supervisor = nothing is auto-resolved):
+#
+#   * MQTT — there is no Mosquitto add-on to borrow, so the broker MUST be given
+#     explicitly to the bridge via MQTT_HOST / MQTT_PORT / MQTT_USERNAME /
+#     MQTT_PASSWORD / MQTT_SSL (set below, or in a .env file next to this one).
+#   * Scope(s) — the bridge enumerates scopes from seestar_alp, so seestar_alp
+#     must know them. In BUNDLED mode (default below) that means a config.toml
+#     bind-mounted into the seestar_alp service. In EXTERNAL mode you point
+#     ALPACA_HOST at an existing seestar_alp that already has its scopes.
+#
+# ---------------------------------------------------------------------------
+# BUNDLED vs EXTERNAL — pick ONE:
+#
+#   * BUNDLED (default): run the `seestar_alp` service below from this same image
+#     and point the bridge at it by container name (ALPACA_HOST=seestar_alp:5555).
+#     Provide seestar_alp's scope list via the config.toml bind-mount.
+#
+#   * EXTERNAL: you already run seestar_alp elsewhere on the network. Delete (or
+#     `profiles`-disable) the `seestar_alp` service below, and set
+#     ALPACA_HOST=<your-seestar_alp-host>:5555 on the bridge. The bridge reads the
+#     scope addresses for the preview from that host's /config.json (or the /config
+#     HTML page on older seestar_alp) — see ALPACA_WEBUI_PORT.
+# ---------------------------------------------------------------------------
+
+services:
+  # --- Bundled Alpaca driver (delete this service for EXTERNAL mode) ----------
+  seestar_alp:
+    image: ghcr.io/jaxzin/ha-seestar-${ARCH:-amd64}
+    # To build locally instead of pulling, uncomment and run `up -d --build`:
+    # build:
+    #   context: ./seestar
+    #   args:
+    #     BUILD_FROM: ghcr.io/home-assistant/${ARCH:-amd64}-base-python:3.12-alpine3.20
+    container_name: seestar_alp
+    restart: unless-stopped
+    working_dir: /app/seestar_alp
+    # Run ONLY the driver, bypassing the s6/bashio init (which needs the Supervisor).
+    command: ["python3", "root_app.py"]
+    networks:
+      - seestar-net
+    ports:
+      - "5432:5432"   # SSC web UI (the app surfaces this via ingress; here it is a plain port)
+      - "7556:7556"   # imaging API
+      # Alpaca 5555 stays internal to seestar-net; the bridge reaches it by container DNS.
+    volumes:
+      # seestar_alp reads its scopes + ports from this file. Copy
+      # examples/config.toml.sample, fill in your scope name(s) + LAN IP(s), and
+      # keep [network] ip_address='0.0.0.0' so the bridge can reach Alpaca by DNS.
+      - ./config.toml:/app/seestar_alp/device/config.toml:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # --- The telemetry bridge (always runs) ------------------------------------
+  bridge:
+    image: ghcr.io/jaxzin/ha-seestar-${ARCH:-amd64}
+    # build:
+    #   context: ./seestar
+    #   args:
+    #     BUILD_FROM: ghcr.io/home-assistant/${ARCH:-amd64}-base-python:3.12-alpine3.20
+    container_name: seestar_bridge
+    restart: unless-stopped
+    depends_on:
+      - seestar_alp           # remove this line in EXTERNAL mode
+    networks:
+      - seestar-net
+    environment:
+      # Bridge runtime config. The s6 run script normally sets PYTHONPATH; do the
+      # same here since we launch python directly.
+      PYTHONPATH: /app/bridge
+      # MQTT (REQUIRED — no Supervisor service to fall back on). Move the secrets
+      # into a .env file beside this compose file if you prefer.
+      MQTT_HOST: ${MQTT_HOST:?set MQTT_HOST (your broker) in the environment or a .env file}
+      MQTT_PORT: ${MQTT_PORT:-1883}
+      MQTT_USERNAME: ${MQTT_USERNAME:-}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+      MQTT_SSL: ${MQTT_SSL:-false}
+    command: ["python3", "-m", "seestar_bridge.main"]
+    volumes:
+      # The bridge reads its non-MQTT options from /data/options.json (the same
+      # file the Supervisor would mount). It carries the scope-source choice
+      # (alpaca_host) + the tuning knobs. See examples/options.json.sample.
+      - ./options.json:/data/options.json:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  seestar-net:
+    name: seestar-net
