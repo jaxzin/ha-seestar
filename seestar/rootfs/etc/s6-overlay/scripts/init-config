@@ -93,6 +93,11 @@ fi
 bashio::log.info "Rendering bundled seestar_alp config.toml for $(bashio::config 'scopes | length') scope(s)."
 mkdir -p "$(dirname "${CONFIG_TOML_PATH}")"
 
+# seestar_alp reads [logging] log_level verbatim (uppercase, via
+# logging.getLevelName); mirror the bridge's log_level option so the bundled
+# driver honors it too. Default to INFO when the option is blank.
+log_level_upper="$(bashio::config 'log_level' 'info' | tr '[:lower:]' '[:upper:]')"
+
 {
     # Bind to all interfaces so the bridge reaches Alpaca by container DNS and
     # the imaging/web-UI ports are reachable through ingress + the published port.
@@ -104,10 +109,16 @@ mkdir -p "$(dirname "${CONFIG_TOML_PATH}")"
     echo "[webui_settings]"
     echo "uiport = ${WEBUI_PORT}"
     echo ""
-    # Surface the driver's logs in the add-on log stream (default is a file).
+    # Surface the driver's logs in the add-on log stream (default is a file) and
+    # honor the operator's log_level (uppercase, the form seestar_alp expects).
     echo "[logging]"
     echo "log_to_stdout = true"
+    echo "log_level = '${log_level_upper}'"
 } > "${CONFIG_TOML_PATH}"
+
+# config.toml holds only scope names + LAN IPs (never secrets — those live in
+# /run/s6/container_environment). Keep it readable by the service user only.
+chmod 0640 "${CONFIG_TOML_PATH}"
 
 # Escape backslashes and double-quotes so an operator-supplied value can't break
 # out of the TOML basic string it is embedded in.

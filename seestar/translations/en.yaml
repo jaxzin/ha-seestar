@@ -5,14 +5,18 @@ configuration:
     name: Telescopes
     description: >-
       Bundled mode only. One entry per Seestar — each becomes its own Home
-      Assistant device and seeds the bundled driver's config. Leave empty if you
-      point alpaca_host at an existing seestar_alp instead.
+      Assistant device and seeds the bundled driver's config. Each entry needs a
+      name (the HA device name — pick a stable one, since renaming it later
+      creates a new device and new entity IDs) and a host (the telescope's IP
+      address or hostname on your LAN). Leave empty if you point alpaca_host at an
+      existing seestar_alp instead.
   alpaca_host:
     name: External Alpaca driver
     description: >-
-      Leave blank to use the bundled driver; set host:port to reuse your own
-      seestar_alp. When set, the bundled driver does not start and the telescopes
-      list is ignored (the external instance already knows your scopes).
+      Leave blank to use the bundled driver. To reuse your own seestar_alp
+      instead, set host:port here AND leave the Telescopes list empty — the
+      external instance already knows your scopes. Setting both is rejected at
+      startup.
   alpaca_webui_port:
     name: External web UI port
     description: >-
