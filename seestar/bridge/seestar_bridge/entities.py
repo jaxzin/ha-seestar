@@ -25,11 +25,35 @@ _PAYLOAD_OFF = "OFF"
 _PAYLOAD_AVAILABLE = "online"
 _PAYLOAD_NOT_AVAILABLE = "offline"
 
+#: An entity is available only when EVERY topic in its availability list reports
+#: ``online`` — i.e. both the bridge process is alive (its LWT topic) AND the
+#: scope is reachable (the per-scope topic). ``"any"`` would mark it available
+#: when only one is up, which would lie about a dead scope behind a live bridge.
+_AVAILABILITY_MODE_ALL = "all"
+
 # Sub-topics appended to a scope's base topic. Kept as constants so the producer
 # (this module) and the consumer (the scope worker that publishes to these
 # topics) agree on the wire format.
 _STATE_SUBTOPIC = "state"
 _AVAILABILITY_SUBTOPIC = "availability"
+
+
+def availability_list(*topics: str) -> list[dict[str, str]]:
+    """Build an MQTT-discovery ``availability`` list over one or more topics.
+
+    Each entry uses the shared ``online``/``offline`` payloads. Combined with
+    ``availability_mode: "all"`` (see :data:`_AVAILABILITY_MODE_ALL`), an entity
+    is available only when every listed topic reports ``online`` — used to AND
+    the bridge-level liveness (LWT) with the per-scope reachability signal.
+    """
+    return [
+        {
+            "topic": topic,
+            "payload_available": _PAYLOAD_AVAILABLE,
+            "payload_not_available": _PAYLOAD_NOT_AVAILABLE,
+        }
+        for topic in topics
+    ]
 
 # Static identity for the Seestar S30 Pro hardware. Per-scope identity (id/name)
 # is injected via ``device_block`` so multiple scopes don't collide.
@@ -152,18 +176,23 @@ def discovery_payload(
     *,
     device_block: dict[str, Any],
     base_topic: str,
+    bridge_availability_topic: str,
 ) -> dict[str, Any]:
     """Build the MQTT discovery config for one entity.
 
     ``device_block`` (from :func:`device_block`) supplies the per-scope device
     identity, and its first identifier is reused as the id-namespace for
     ``unique_id``/``object_id``. ``base_topic`` (e.g. ``seestar/<device_id>``)
-    roots the state + availability topics. Optional metadata (unit, device/state
-    class, icon) is only emitted when the catalog provides it.
+    roots the state topic and the per-scope availability topic.
+    ``bridge_availability_topic`` is the process-level LWT topic shared by every
+    scope; the two are combined in an ``availability`` LIST with
+    ``availability_mode: "all"``, so the entity is available only when BOTH the
+    bridge is alive AND its scope is reachable. Optional metadata (unit,
+    device/state class, icon) is only emitted when the catalog provides it.
     """
     device_id = device_block["identifiers"][0]
     state_topic = f"{base_topic}/{_STATE_SUBTOPIC}"
-    availability_topic = f"{base_topic}/{_AVAILABILITY_SUBTOPIC}"
+    scope_availability_topic = f"{base_topic}/{_AVAILABILITY_SUBTOPIC}"
 
     if entity.component == _COMPONENT_BINARY_SENSOR:
         template = _BINARY_TEMPLATE % entity.key
@@ -175,9 +204,8 @@ def discovery_payload(
         "unique_id": f"{device_id}_{entity.key}",
         "object_id": f"{device_id}_{entity.key}",
         "state_topic": state_topic,
-        "availability_topic": availability_topic,
-        "payload_available": _PAYLOAD_AVAILABLE,
-        "payload_not_available": _PAYLOAD_NOT_AVAILABLE,
+        "availability": availability_list(bridge_availability_topic, scope_availability_topic),
+        "availability_mode": _AVAILABILITY_MODE_ALL,
         "value_template": template,
         "device": device_block,
     }

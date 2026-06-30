@@ -10,8 +10,13 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import seestar_bridge.main as main_mod
 from seestar_bridge.entities import ENTITIES
-from seestar_bridge.main import assign_device_ids, build_workers
+from seestar_bridge.main import (
+    BRIDGE_AVAILABILITY_TOPIC,
+    assign_device_ids,
+    build_workers,
+)
 from seestar_bridge.settings import MqttSettings, Settings
 
 DEVICES = [
@@ -128,7 +133,7 @@ def test_one_state_publish_per_device_from_canned_event_state():
         workers = build_workers(alpaca=_alpaca(base), settings=_settings(base), mqtt_client=fake_mqtt)
         fake_mqtt.published.clear()  # drop discovery; assert only the state cycle
         for worker in workers:
-            state, _saved = worker._poll_once(now=1782799000.0)
+            state, _saved, _reachable = worker._poll_once(now=1782799000.0)
             worker._mqtt.publish(worker.availability_topic, "online", retain=True)
             worker._mqtt.publish(worker.state_topic, json.dumps(state), retain=True)
     finally:
@@ -142,6 +147,38 @@ def test_one_state_publish_per_device_from_canned_event_state():
         assert payload["telephoto_target"] == "NGC 7000"
         assert payload["telephoto_state"] == "working"
         assert payload["stacked_frames"] == 5
+
+
+def test_main_wires_bridge_lwt_and_publishes_online(monkeypatch):
+    # BLOCKER 2 (b): main must build the client with the bridge LWT (will_topic +
+    # 'offline' payload) and publish the bridge availability 'online' (retained)
+    # after connecting, so the broker can mark the bridge offline if it dies.
+    calls = {}
+    mqtt_client = _FakeMqtt()
+
+    def fake_load_settings(_options, _env):
+        return _settings("http://stub")
+
+    def fake_build_client(mqtt_settings, *, will_topic=None, will_payload="offline"):
+        calls["will_topic"] = will_topic
+        calls["will_payload"] = will_payload
+        # connect/loop_start are no-ops on the fake; publish is captured.
+        mqtt_client.connect = lambda *a, **k: None
+        mqtt_client.loop_start = lambda *a, **k: None
+        return mqtt_client
+
+    monkeypatch.setattr(main_mod, "load_settings", fake_load_settings)
+    monkeypatch.setattr(main_mod, "build_client", fake_build_client)
+    monkeypatch.setattr(main_mod, "Alpaca", lambda *a, **k: object())
+    # No scopes + no threads to join, so main() returns instead of blocking.
+    monkeypatch.setattr(main_mod, "build_workers", lambda *a, **k: [])
+
+    main_mod.main()
+
+    assert calls["will_topic"] == BRIDGE_AVAILABILITY_TOPIC
+    assert calls["will_payload"] == "offline"
+    online = [(t, p, r) for t, p, r in mqtt_client.published if t == BRIDGE_AVAILABILITY_TOPIC]
+    assert online == [(BRIDGE_AVAILABILITY_TOPIC, "online", True)]
 
 
 def _alpaca(base):

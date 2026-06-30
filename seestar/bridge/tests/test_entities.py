@@ -19,6 +19,7 @@ from seestar_bridge.entities import (
 DEVICE_ID = "seestar_s30_pro"
 DEVICE_NAME = "Seestar S30 Pro"
 BASE_TOPIC = f"seestar/{DEVICE_ID}"
+BRIDGE_AVAILABILITY_TOPIC = "seestar/bridge/availability"
 
 
 def _entity(key):
@@ -31,7 +32,12 @@ def _entity(key):
 
 def _payload(key):
     block = device_block(DEVICE_ID, DEVICE_NAME)
-    return discovery_payload(_entity(key), device_block=block, base_topic=BASE_TOPIC)
+    return discovery_payload(
+        _entity(key),
+        device_block=block,
+        base_topic=BASE_TOPIC,
+        bridge_availability_topic=BRIDGE_AVAILABILITY_TOPIC,
+    )
 
 
 def test_slug_normalizes_name():
@@ -92,11 +98,18 @@ def test_payload_carries_optional_metadata_only_when_present():
     assert "state_class" not in target
 
 
-def test_payload_availability_topic_is_device_scoped():
+def test_payload_availability_lists_both_bridge_and_scope_topics_with_mode_all():
     payload = _payload("tracking")
-    assert payload["availability_topic"] == f"{BASE_TOPIC}/availability"
-    assert payload["payload_available"] == "online"
-    assert payload["payload_not_available"] == "offline"
+    # A single availability_topic would mark the entity available whenever the
+    # scope publishes 'online' even if the bridge has died; the two-topic list
+    # with mode 'all' ANDs bridge-liveness (LWT) with scope-reachability.
+    assert "availability_topic" not in payload
+    assert payload["availability_mode"] == "all"
+    topics = [entry["topic"] for entry in payload["availability"]]
+    assert topics == [BRIDGE_AVAILABILITY_TOPIC, f"{BASE_TOPIC}/availability"]
+    for entry in payload["availability"]:
+        assert entry["payload_available"] == "online"
+        assert entry["payload_not_available"] == "offline"
 
 
 def test_device_block_identifies_the_scope():

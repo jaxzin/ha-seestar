@@ -1,19 +1,22 @@
 """Per-scope worker: pure state extraction + the live poll/publish loop.
 
 One :class:`ScopeWorker` owns one telescope. :meth:`ScopeWorker.build_state` is
-PURE — it maps a seestar_alp ``get_event_state`` dict to the entity-key state
-dict whose keys exactly match :data:`seestar_bridge.entities.ENTITIES` — and is
-deliberately importable without paho or Pillow (the MQTT factory lives in
-``mqtt.py``; Pillow is lazy-imported inside the preview fetch). Everything that
-was a module-global in the validated Phase-1 bridge (device id/name, base topic,
-the cached GPS site) is now per-instance, so a single process can drive a
-distinct HA device per scope.
+PURE — it maps a seestar_alp ``get_event_state`` dict to a state dict whose keys
+are a SUBSET of :data:`seestar_bridge.entities.ENTITIES` (only the fields present
+in the event are written; the remaining catalog keys are filled by
+:meth:`extract_device_state`, the park/home probes, and the connectivity set in
+:meth:`run`) — and is deliberately importable without paho or Pillow (the MQTT
+factory lives in ``mqtt.py``; Pillow is lazy-imported inside the preview fetch).
+Everything that was a module-global in the validated Phase-1 bridge (device
+id/name, base topic, the cached GPS site) is now per-instance, so a single
+process can drive a distinct HA device per scope.
 
 :meth:`ScopeWorker.run` is the loop: tap the non-blocking event stream every
 ``event_poll_sec``; probe ``get_device_state`` on a slow cadence with the
 Phase-1 exponential backoff (it only answers when the scope is briefly idle);
 fetch + downscale the saved stack preview whenever a new ``SaveImage`` lands;
-and publish availability + the state JSON each cycle.
+and publish the per-scope availability ('online' only when the scope is actually
+reachable) + the state JSON each cycle.
 """
 from __future__ import annotations
 
@@ -27,7 +30,13 @@ import urllib.request
 from typing import Any
 
 from .altaz import radec_to_altaz
-from .entities import ENTITIES, device_block, discovery_payload, slug
+from .entities import (
+    ENTITIES,
+    availability_list,
+    device_block,
+    discovery_payload,
+    slug,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -75,6 +84,14 @@ _PREVIEW_SUBTOPIC = "preview"
 _PAYLOAD_AVAILABLE = "online"
 _PAYLOAD_NOT_AVAILABLE = "offline"
 
+#: Match the entity discovery: an entity (and the camera) is available only when
+#: BOTH the bridge LWT topic and the per-scope availability topic report online.
+_AVAILABILITY_MODE_ALL = "all"
+
+#: Entity key for the connectivity binary_sensor; set every cycle from the
+#: scope's Alpaca ``connected`` property so the sensor reflects reality.
+_CONNECTED_KEY = "connected"
+
 _CAMERA_COMPONENT = "camera"
 _CAMERA_KEY = "preview"
 _CAMERA_NAME = "Live stacked preview"
@@ -89,6 +106,22 @@ _JPEG_MAGIC = b"\xff\xd8"
 
 _PREVIEW_TIMEOUT_SEC = 30
 _JPEG_QUALITY = 85
+
+#: Hard cap on the preview body we fetch + decode. The scope's stacked .jpg is a
+#: few MiB; anything over this is either not the file we expect or an attempt to
+#: exhaust memory, so we reject it (mirrors discovery.py's _read_capped pattern).
+_MAX_PREVIEW_BYTES = 32 * 1024 * 1024
+
+#: Pillow pixel ceiling: an image whose pixel count exceeds this raises
+#: ``Image.DecompressionBombError`` promptly during decode, rather than letting a
+#: maliciously small-but-huge-canvas JPEG balloon into gigabytes of RAM. Sized
+#: well above a real stacked frame (the S30 sensor is well under 50 MP).
+_MAX_IMAGE_PIXELS = 80_000_000
+
+#: The path segment every legitimate saved stack lives under on the scope; we
+#: reject a fetch whose derived path escapes it (no traversal outside MyWorks/).
+_PREVIEW_PATH_PREFIX = "MyWorks/"
+_PARENT_DIR_SEGMENT = ".."
 
 #: Best-effort ``get_device_state`` starves seestar_alp's web UI when it times
 #: out, so we back off exponentially during capture. The Phase-1 cap keeps us
@@ -105,6 +138,21 @@ _SITE_LON_PROP = "sitelongitude"
 #: The method_sync RPC that returns the best-effort health/mount block.
 _DEVICE_STATE_METHOD = "get_device_state"
 _EVENT_STATE_ACTION = "get_event_state"
+
+
+def _pillow_decode_errors() -> tuple[type[Exception], ...]:
+    """Pillow's decode-failure exception types, or empty when Pillow is absent.
+
+    Kept lazy (Pillow is imported on demand) so ``build_state`` stays importable
+    without imaging libs. ``DecompressionBombError`` subclasses ``Exception`` (a
+    bomb is an error here, not a warning), and ``UnidentifiedImageError``/``OSError``
+    cover a truncated or non-image body. Used to harden the preview-publish path.
+    """
+    try:
+        from PIL import Image, UnidentifiedImageError
+    except ModuleNotFoundError:
+        return ()
+    return (Image.DecompressionBombError, UnidentifiedImageError)
 
 
 def _nav(obj: Any, *path: Any, default: Any = None) -> Any:
@@ -128,16 +176,25 @@ class ScopeWorker:
     ``None`` the preview degrades gracefully and is skipped.
     """
 
-    def __init__(self, alpaca, device, settings, mqtt_client, scope_http_base, *, device_id=None):
+    def __init__(self, alpaca, device, settings, mqtt_client, scope_http_base,
+                 *, device_id=None, bridge_availability_topic=None):
         self._alpaca = alpaca
         self._device = device
         self._settings = settings
         self._mqtt = mqtt_client
         self._scope_http_base = scope_http_base.rstrip("/") if scope_http_base else None
+        device_num = device.get("DeviceNumber")
         # Stable HA device id = slug of the scope name (caller may override to
-        # disambiguate a name collision by device_num).
-        self._device_id = device_id or slug(device.get("DeviceName", ""))
+        # disambiguate a name collision by device_num). Apply the same empty-slug
+        # fallback main.assign_device_ids uses so an unnamed scope can never
+        # produce a 'seestar//state' topic from a blank id.
+        self._device_id = device_id or slug(device.get("DeviceName", "")) or f"scope_{device_num}"
         self._device_name = device.get("DeviceName", self._device_id)
+        # Process-level liveness topic (the broker's LWT marks it offline if the
+        # bridge dies); combined with the per-scope availability topic so an
+        # entity is available only when both are up. Defaults to the scope's own
+        # topic when unset, degrading to per-scope-only liveness.
+        self._bridge_availability_topic = bridge_availability_topic or self.availability_topic
         # Observer location from the scope's own GPS; cached once, never published.
         self._site_lat: float | None = None
         self._site_lon: float | None = None
@@ -353,16 +410,21 @@ class ScopeWorker:
         prefix = self._settings.discovery_prefix
         for entity in ENTITIES:
             topic = f"{prefix}/{entity.component}/{self._device_id}/{entity.key}/config"
-            payload = discovery_payload(entity, device_block=block, base_topic=self.base_topic)
+            payload = discovery_payload(
+                entity,
+                device_block=block,
+                base_topic=self.base_topic,
+                bridge_availability_topic=self._bridge_availability_topic,
+            )
             self._mqtt.publish(topic, json.dumps(payload), retain=True)
         camera = {
             "name": _CAMERA_NAME,
             "unique_id": f"{self._device_id}_{_CAMERA_KEY}",
             "object_id": f"{self._device_id}_{_CAMERA_KEY}",
             "topic": self.preview_topic,
-            "availability_topic": self.availability_topic,
-            "payload_available": _PAYLOAD_AVAILABLE,
-            "payload_not_available": _PAYLOAD_NOT_AVAILABLE,
+            "availability": availability_list(
+                self._bridge_availability_topic, self.availability_topic),
+            "availability_mode": _AVAILABILITY_MODE_ALL,
             "device": block,
         }
         camera_topic = f"{prefix}/{_CAMERA_COMPONENT}/{self._device_id}/{_CAMERA_KEY}/config"
@@ -372,27 +434,91 @@ class ScopeWorker:
         """Fetch the saved stacked .jpg from the scope's HTTP server, downscaled.
 
         Pillow is lazy-imported here so ``build_state`` stays importable without
-        it. Returns JPEG bytes, or ``None`` if no scope address is known or the
-        body is not a JPEG. Publishes full-size if Pillow is unavailable.
+        it. Returns the downscaled JPEG bytes (the caller publishes them), or
+        ``None`` if no scope address is known, the derived path escapes
+        ``MyWorks/``, the body is over-cap or not a JPEG, or the decode fails.
+        When Pillow is unavailable it RETURNS the raw (full-size) bytes for the
+        caller to publish. The fetch is bounded to :data:`_MAX_PREVIEW_BYTES` and
+        the decode to :data:`_MAX_IMAGE_PIXELS`, so neither an oversized body nor
+        a decompression-bomb JPEG can exhaust the worker's memory.
         """
         if not self._scope_http_base:
             return None
         jpg_path = fullname.rsplit(".", 1)[0] + _JPG_SUFFIX
-        url = f"{self._scope_http_base}/{urllib.parse.quote(jpg_path)}"
-        with urllib.request.urlopen(url, timeout=_PREVIEW_TIMEOUT_SEC) as resp:
-            raw = resp.read()
-        if raw[:len(_JPEG_MAGIC)] != _JPEG_MAGIC:
+        if not self._preview_path_is_safe(jpg_path):
+            _log.warning("%s: rejecting preview path outside %s: %r",
+                         self._device_id, _PREVIEW_PATH_PREFIX, jpg_path)
             return None
+        # quote with safe='' so every '/' is escaped: the scope-provided path is
+        # untrusted, and a stray segment must not let the URL walk the server.
+        url = f"{self._scope_http_base}/{urllib.parse.quote(jpg_path, safe='')}"
+        raw = self._fetch_capped(url)
+        if raw is None or raw[:len(_JPEG_MAGIC)] != _JPEG_MAGIC:
+            return None
+        return self._decode_preview(raw)
+
+    @staticmethod
+    def _preview_path_is_safe(jpg_path: str) -> bool:
+        """Reject a derived preview path that escapes the expected MyWorks/ tree.
+
+        The path comes from the scope's own ``SaveImage.fullname`` event, but we
+        never trust it verbatim: it must stay under ``MyWorks/`` with no ``..``
+        parent-dir segment, so a crafted event can't make us fetch an arbitrary
+        URL on the scope.
+        """
+        if not jpg_path.startswith(_PREVIEW_PATH_PREFIX):
+            return False
+        return _PARENT_DIR_SEGMENT not in jpg_path.split("/")
+
+    def _fetch_capped(self, url: str) -> bytes | None:
+        """GET ``url`` reading at most :data:`_MAX_PREVIEW_BYTES`.
+
+        Rejects (returns ``None``) when the advertised ``Content-Length`` exceeds
+        the cap, and reads one byte past the cap to catch an unbounded/chunked
+        body whose length wasn't advertised. Mirrors discovery.py's
+        ``_read_capped`` pattern.
+        """
+        with urllib.request.urlopen(url, timeout=_PREVIEW_TIMEOUT_SEC) as resp:
+            content_length = resp.headers.get("Content-Length")
+            if content_length is not None:
+                try:
+                    if int(content_length) > _MAX_PREVIEW_BYTES:
+                        _log.warning("%s: preview body %s bytes exceeds cap %d; skipping",
+                                     self._device_id, content_length, _MAX_PREVIEW_BYTES)
+                        return None
+                except ValueError:
+                    pass  # bogus header; fall through to the read-side cap
+            raw = resp.read(_MAX_PREVIEW_BYTES + 1)
+        if len(raw) > _MAX_PREVIEW_BYTES:
+            _log.warning("%s: preview body exceeds cap %d (unbounded); skipping",
+                         self._device_id, _MAX_PREVIEW_BYTES)
+            return None
+        return raw
+
+    def _decode_preview(self, raw: bytes) -> bytes | None:
+        """Downscale ``raw`` JPEG bytes; never let a bad image kill the worker.
+
+        Returns the re-encoded JPEG, the raw bytes when Pillow is unavailable, or
+        ``None`` if decoding fails (a truncated/garbage JPEG, an unidentifiable
+        body, or a decompression bomb tripping the pixel ceiling).
+        """
         try:
-            from PIL import Image
+            from PIL import Image, UnidentifiedImageError
         except ModuleNotFoundError:
             return raw  # publish full-size if Pillow is unavailable
+        # Module-level pixel ceiling so a decompression-bomb JPEG raises promptly
+        # instead of inflating into gigabytes of RAM during decode.
+        Image.MAX_IMAGE_PIXELS = _MAX_IMAGE_PIXELS
         max_px = self._settings.preview_max_px
-        img = Image.open(io.BytesIO(raw))
-        img.thumbnail((max_px, max_px))
-        out = io.BytesIO()
-        img.convert("RGB").save(out, format="JPEG", quality=_JPEG_QUALITY)
-        return out.getvalue()
+        try:
+            img = Image.open(io.BytesIO(raw))
+            img.thumbnail((max_px, max_px))
+            out = io.BytesIO()
+            img.convert("RGB").save(out, format="JPEG", quality=_JPEG_QUALITY)
+            return out.getvalue()
+        except (Image.DecompressionBombError, UnidentifiedImageError, OSError, ValueError) as exc:
+            _log.warning("%s: preview decode failed; skipping: %s", self._device_id, exc)
+            return None
 
     def ensure_site_location(self) -> None:
         """Acquire + cache the scope's GPS site once (for Alt/Az); never published.
@@ -412,9 +538,14 @@ class ScopeWorker:
     def run(self) -> None:
         """Poll events fast, device_state slow (with backoff), publish each cycle.
 
-        Runs forever; intended to be the target of a per-scope thread. Event
-        failures and best-effort device_state timeouts are logged via the
-        loop's accounting and never abort the loop.
+        Runs forever; intended to be the target of a per-scope thread. The loop
+        never aborts: a failed event poll is caught in :meth:`_poll_once` (which
+        logs the exception and returns an empty state with ``reachable=False``),
+        a busy ``get_device_state`` raises ``TimeoutError`` that drives the
+        backoff here, and a bad preview is swallowed in :meth:`_maybe_publish_preview`.
+        Each cycle publishes the per-scope availability topic ``online`` only when
+        the scope is reachable (the event poll succeeded or ``is_connected()``),
+        ``offline`` otherwise, and sets the ``connected`` state key the same way.
         """
         last_slow = 0.0
         slow_backoff_until = 0.0
@@ -425,9 +556,15 @@ class ScopeWorker:
 
         while True:
             now = time.time()
-            state, saved_fullname = self._poll_once(now)
+            state, saved_fullname, reachable = self._poll_once(now)
+            # The connectivity binary_sensor must have a producer: drive it from
+            # the scope's Alpaca `connected` property (the event poll alone can't
+            # distinguish "scope idle" from "scope disconnected").
+            connected = self._alpaca.is_connected()
+            state[_CONNECTED_KEY] = connected
+            reachable = reachable or connected
 
-            if now - last_slow >= state_poll and now >= slow_backoff_until:
+            if reachable and now - last_slow >= state_poll and now >= slow_backoff_until:
                 last_slow = now
                 try:
                     state.update(self.extract_device_state(
@@ -444,22 +581,29 @@ class ScopeWorker:
                               self._device_id, int(slow_backoff_until - now))
                 self._poll_park_flags(state)
 
-            self._mqtt.publish(self.availability_topic, _PAYLOAD_AVAILABLE, retain=True)
+            # Publish liveness that reflects reality: 'online' only when the scope
+            # actually answered (or reports connected), never a blind 'online'.
+            availability = _PAYLOAD_AVAILABLE if reachable else _PAYLOAD_NOT_AVAILABLE
+            self._mqtt.publish(self.availability_topic, availability, retain=True)
+            # An unreachable scope publishes only the connectivity flag (so the
+            # Connected sensor flips OFF), not a stale/empty 'online' snapshot.
             self._mqtt.publish(self.state_topic, json.dumps(state), retain=True)
             last_preview_file = self._maybe_publish_preview(saved_fullname, last_preview_file)
             time.sleep(event_poll)
 
     def _poll_once(self, now: float):
-        """One fast event tap: build state + return the saved-stack path (if any).
+        """One fast event tap: build state, the saved-stack path, and reachability.
 
-        The event tap is the reliable, non-blocking call; a transient I/O failure
-        publishes an empty state for this cycle rather than aborting the worker.
+        The event tap is the reliable, non-blocking call. A transient I/O failure
+        returns ``({}, None, False)`` — an empty state flagged unreachable for
+        this cycle — rather than aborting the worker; a success returns the built
+        state with ``reachable=True``.
         """
         try:
             event_state = self._alpaca.action(_EVENT_STATE_ACTION, {})
         except _PROBE_ERRORS as exc:
             _log.warning("%s: event poll failed: %s", self._device_id, exc)
-            return {}, None
+            return {}, None, False
         state = self.build_state(event_state if isinstance(event_state, dict) else {}, unix_t=now)
         self._ensure_site_location_safe()
         if (self._site_lat is not None and state.get("ra") is not None
@@ -468,7 +612,7 @@ class ScopeWorker:
             state["altitude"], state["azimuth"] = radec_to_altaz(
                 state["ra"], state["dec"], self._site_lat, self._site_lon, now)
         saved_fullname = _nav(event_state, "SaveImage", "fullname")
-        return state, saved_fullname
+        return state, saved_fullname, True
 
     def _ensure_site_location_safe(self) -> None:
         """Acquire the GPS site, tolerating a transient probe failure (retried)."""
@@ -488,15 +632,19 @@ class ScopeWorker:
     def _maybe_publish_preview(self, saved_fullname, last_preview_file):
         """Publish a fresh preview whenever the scope saves a new stacked image.
 
-        A preview fetch failure is non-fatal: log it and keep the prior file so
-        the next new save retries.
+        A preview fetch/decode failure is non-fatal: log it and keep the prior
+        file so the next new save retries. ``fetch_preview`` already swallows
+        decode errors internally; the Pillow exceptions are also caught here as a
+        backstop so a bad preview degrades to skip-this-cycle rather than killing
+        the loop, no matter where the failure surfaces.
         """
         if not saved_fullname or saved_fullname == last_preview_file:
             return last_preview_file
         try:
             frame = self.fetch_preview(saved_fullname)
-        except _PROBE_ERRORS as exc:
-            _log.warning("%s: preview fetch failed: %s", self._device_id, exc)
+        except (*_PROBE_ERRORS, *_pillow_decode_errors()) as exc:
+            _log.warning("%s: preview fetch failed; skipping this cycle: %s",
+                         self._device_id, exc)
             return last_preview_file
         if frame:
             self._mqtt.publish(self.preview_topic, frame, qos=0, retain=True)

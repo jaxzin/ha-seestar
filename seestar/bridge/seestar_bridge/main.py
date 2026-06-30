@@ -33,6 +33,14 @@ _DEVICE_NUMBER_KEY = "DeviceNumber"
 _MQTT_KEEPALIVE_SEC = 60
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
+#: Process-level liveness topic shared by every scope. The broker publishes
+#: ``offline`` here (the Last-Will) if the bridge dies, and main publishes
+#: ``online`` after connecting; every entity ANDs this with its per-scope
+#: availability topic, so a dead bridge marks ALL scopes unavailable at once.
+BRIDGE_AVAILABILITY_TOPIC = "seestar/bridge/availability"
+_PAYLOAD_AVAILABLE = "online"
+_PAYLOAD_NOT_AVAILABLE = "offline"
+
 
 def assign_device_ids(devices: list[dict]) -> dict[int, str]:
     """Map each device's ``DeviceNumber`` -> a stable, unique HA device id.
@@ -41,6 +49,13 @@ def assign_device_ids(devices: list[dict]) -> dict[int, str]:
     deliberately not used). When two scopes slug to the same id, the colliding
     ones are disambiguated by appending ``_<device_num>`` so each HA device stays
     distinct and stable across restarts.
+
+    Known caveat: the disambiguation suffix is *conditional* on a same-named
+    sibling being present. If two scopes share a name and one is later removed,
+    the survivor's slug no longer collides, so its id loses the ``_<device_num>``
+    suffix — i.e. its HA device id changes across that reconfiguration. This is
+    acceptable for v1; the fix is operational: give same-named scopes distinct
+    names so neither id ever carries a collision suffix.
     """
     def base_id(device: dict) -> str:
         return slug(device.get(_DEVICE_NAME_KEY, "")) or f"scope_{int(device[_DEVICE_NUMBER_KEY])}"
@@ -86,6 +101,7 @@ def build_workers(alpaca, settings: Settings, mqtt_client) -> list[ScopeWorker]:
             mqtt_client=mqtt_client,
             scope_http_base=scope_http_base,
             device_id=device_ids[device_num],
+            bridge_availability_topic=BRIDGE_AVAILABILITY_TOPIC,
         )
         worker.publish_discovery()
         workers.append(worker)
@@ -103,9 +119,16 @@ def main() -> None:
     # Alpaca clients (bound to the real device numbers) are built in build_workers.
     alpaca = Alpaca(settings.alpaca_base, 0)
 
-    mqtt_client = build_client(settings.mqtt)
+    mqtt_client = build_client(
+        settings.mqtt,
+        will_topic=BRIDGE_AVAILABILITY_TOPIC,
+        will_payload=_PAYLOAD_NOT_AVAILABLE,
+    )
     mqtt_client.connect(settings.mqtt.host, settings.mqtt.port, keepalive=_MQTT_KEEPALIVE_SEC)
     mqtt_client.loop_start()
+    # Announce the bridge alive (retained) once connected; the LWT above flips
+    # this back to 'offline' if the process dies without a clean disconnect.
+    mqtt_client.publish(BRIDGE_AVAILABILITY_TOPIC, _PAYLOAD_AVAILABLE, retain=True)
 
     workers = build_workers(alpaca, settings, mqtt_client)
     if not workers:
