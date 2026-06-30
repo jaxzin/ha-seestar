@@ -93,3 +93,50 @@ def test_valueerror_when_neither_scopes_nor_alpaca_host():
     options = {}
     with pytest.raises(ValueError, match="scopes"):
         load_settings(options, _mqtt_env())
+
+
+def test_mqtt_port_zero_option_falls_back_to_default():
+    # Supervisor always passes mqtt_port present (config.yaml default 0); when the
+    # operator sets mqtt_host but leaves the port at 0, resolve the standard 1883
+    # rather than the invalid port 0.
+    options = {
+        "scopes": [{"name": "Backyard"}],
+        "mqtt_host": "broker.example.com",
+        "mqtt_port": 0,
+    }
+    s = load_settings(options, _mqtt_env())
+
+    assert s.mqtt.host == "broker.example.com"
+    assert s.mqtt.port == 1883
+
+
+@pytest.mark.parametrize("port_value", ["", "0"])
+def test_mqtt_port_blank_or_zero_env_falls_back_to_default(port_value):
+    # The bashio env exports MQTT_PORT as a string; '' or '0' must resolve to 1883.
+    options = {"scopes": [{"name": "Backyard"}]}
+    env = {**_mqtt_env(), "MQTT_PORT": port_value}
+    s = load_settings(options, env)
+
+    assert s.mqtt.host == "core-mosquitto"
+    assert s.mqtt.port == 1883
+
+
+def test_log_level_defaults_to_info():
+    options = {"scopes": [{"name": "Backyard"}]}
+    s = load_settings(options, _mqtt_env())
+
+    assert s.log_level == "info"
+
+
+def test_log_level_flows_through_normalized():
+    # An operator-supplied level flows into Settings, normalized to lowercase.
+    options = {"scopes": [{"name": "Backyard"}], "log_level": "DEBUG"}
+    s = load_settings(options, _mqtt_env())
+
+    assert s.log_level == "debug"
+
+
+def test_log_level_invalid_rejected():
+    options = {"scopes": [{"name": "Backyard"}], "log_level": "verbose"}
+    with pytest.raises(ValueError, match="log_level"):
+        load_settings(options, _mqtt_env())

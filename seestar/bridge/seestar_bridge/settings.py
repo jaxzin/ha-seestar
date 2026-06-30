@@ -22,6 +22,12 @@ DEFAULT_DISCOVERY_PREFIX = "homeassistant"
 DEFAULT_EVENT_POLL_SEC = 10
 DEFAULT_STATE_POLL_SEC = 30
 DEFAULT_PREVIEW_MAX_PX = 1280
+DEFAULT_LOG_LEVEL = "info"
+DEFAULT_MQTT_PORT = 1883
+
+# Levels the config.yaml schema offers (bashio list). Anything outside this set
+# is rejected so a typo fails fast instead of silently degrading to a default.
+VALID_LOG_LEVELS = ("trace", "debug", "info", "notice", "warning", "error", "fatal")
 
 # Bundled seestar_alp binds Alpaca + the web UI to these ports (see config.toml /
 # the init-config oneshot). In external mode the Alpaca port comes from
@@ -55,6 +61,7 @@ class Settings:
     event_poll_sec: int
     state_poll_sec: int
     preview_max_px: int
+    log_level: str
     mqtt: MqttSettings
 
 
@@ -72,6 +79,37 @@ def _host_of(host_port):
     return host_port.rsplit(":", 1)[0] if ":" in host_port else host_port
 
 
+def _resolve_port(value):
+    """Coerce a port value to int, treating 0/blank/None as unset.
+
+    Supervisor always passes ``mqtt_port`` present (config.yaml default ``0``) and
+    the bashio env exports ``MQTT_PORT`` as a string, so an operator who sets
+    ``mqtt_host`` but leaves the port at its ``0`` default would otherwise resolve
+    to an invalid port ``0``. Treat that — and an empty string — as "use the
+    standard MQTT port".
+    """
+    if value in (None, "", 0, "0"):
+        return DEFAULT_MQTT_PORT
+    return int(value)
+
+
+def _resolve_log_level(value):
+    """Normalize a log-level option to a known lowercase level, defaulting to info.
+
+    Rejects an unrecognized level so a typo fails fast (``ValueError``) rather than
+    silently degrading. Returned lowercase; callers uppercase it for the stdlib
+    ``logging`` module and the upstream driver's ``[logging] log_level`` key.
+    """
+    if not value:
+        return DEFAULT_LOG_LEVEL
+    level = str(value).strip().lower()
+    if level not in VALID_LOG_LEVELS:
+        raise ValueError(
+            f"Invalid log_level '{value}': choose one of {', '.join(VALID_LOG_LEVELS)}."
+        )
+    return level
+
+
 def _resolve_mqtt(options, env):
     """MQTT from ``mqtt_*`` options when host is set, else from the Supervisor env.
 
@@ -82,7 +120,7 @@ def _resolve_mqtt(options, env):
     if opt_host:
         return MqttSettings(
             host=opt_host,
-            port=int(options.get("mqtt_port", 1883)),
+            port=_resolve_port(options.get("mqtt_port")),
             username=options.get("mqtt_username", "") or "",
             password=options.get("mqtt_password", "") or "",
             ssl=_as_bool(options.get("mqtt_ssl")),
@@ -92,15 +130,15 @@ def _resolve_mqtt(options, env):
     if env_host:
         return MqttSettings(
             host=env_host,
-            port=int(env.get("MQTT_PORT", 1883)),
+            port=_resolve_port(env.get("MQTT_PORT")),
             username=env.get("MQTT_USERNAME", "") or "",
             password=env.get("MQTT_PASSWORD", "") or "",
             ssl=_as_bool(env.get("MQTT_SSL")),
         )
 
     raise ValueError(
-        "MQTT broker could not be resolved: enable the Mosquitto add-on (so the "
-        "Supervisor MQTT service is available) or set the mqtt_host/mqtt_port/"
+        "MQTT broker could not be resolved: install the official Mosquitto add-on "
+        "(so the Supervisor MQTT service is available) or set the mqtt_host/mqtt_port/"
         "mqtt_username/mqtt_password options."
     )
 
@@ -139,5 +177,6 @@ def load_settings(options, env):
         event_poll_sec=int(options.get("event_poll_sec", DEFAULT_EVENT_POLL_SEC)),
         state_poll_sec=int(options.get("state_poll_sec", DEFAULT_STATE_POLL_SEC)),
         preview_max_px=int(options.get("preview_max_px", DEFAULT_PREVIEW_MAX_PX)),
+        log_level=_resolve_log_level(options.get("log_level")),
         mqtt=_resolve_mqtt(options, env),
     )

@@ -260,6 +260,7 @@ def _cycle_settings():
         event_poll_sec=10,
         state_poll_sec=30,
         preview_max_px=1280,
+        log_level="info",
         mqtt=MqttSettings(host="broker", port=1883, username="", password="", ssl=False),
     )
 
