@@ -2,6 +2,11 @@
 name = "seestar-bridge"
 version = "1.0.0"
 requires-python = ">=3.12"
+dependencies = [
+    "paho-mqtt~=2.1",
+    "Pillow~=11.0",
+    "tomli~=2.0 ; python_version < '3.11'",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
