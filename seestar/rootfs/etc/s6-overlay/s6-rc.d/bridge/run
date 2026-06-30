@@ -1,0 +1,15 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# ==============================================================================
+# bridge longrun — the seestar_bridge telemetry publisher (always runs).
+#
+# Reads /data/options.json + the environment (MQTT_* exported by init-config when
+# the Mosquitto add-on is used) and publishes MQTT discovery + per-scope state.
+# init-config has already resolved MQTT and, in bundled mode, written config.toml.
+# ==============================================================================
+
+bashio::log.info "Starting seestar_bridge."
+# The bridge package lives under /app/bridge (COPYed in the Dockerfile); put it
+# on PYTHONPATH so `python -m seestar_bridge.main` resolves without installation.
+export PYTHONPATH="/app/bridge${PYTHONPATH:+:${PYTHONPATH}}"
+exec python3 -m seestar_bridge.main

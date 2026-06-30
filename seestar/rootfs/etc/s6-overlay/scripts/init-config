@@ -1,0 +1,139 @@
+#!/usr/bin/env bashio
+# shellcheck shell=bash
+# ==============================================================================
+# init-config oneshot — runs once before the longruns.
+#
+# 1. Resolve the MQTT broker: when the mqtt_host option is blank, read the
+#    Supervisor MQTT service and export it as MQTT_* into the s6 container
+#    environment so the bridge longrun (with-contenv) picks it up. When the
+#    operator pinned mqtt_host, leave it to settings.load_settings.
+# 2. Validate that exactly one telescope source is configured (the bundled
+#    `scopes` list OR an external `alpaca_host`), failing fast otherwise.
+# 3. In bundled mode (alpaca_host blank), render seestar_alp's config.toml from
+#    the `scopes` option to the path settings.BUNDLED_CONFIG_TOML_PATH expects.
+# ==============================================================================
+set -euo pipefail
+
+# Where s6-overlay v3 reads container-wide environment from; files written here
+# are exported into every `with-contenv` service that starts after this oneshot.
+readonly S6_ENV_DIR="/run/s6/container_environment"
+
+# Must match seestar_bridge.settings.BUNDLED_CONFIG_TOML_PATH and the bundled
+# driver's working layout. The init writes it; discovery + the driver read it.
+readonly CONFIG_TOML_PATH="/app/seestar_alp/device/config.toml"
+
+# Bundled seestar_alp binds Alpaca/imaging/web-UI to these ports inside the
+# container; mirrors settings.BUNDLED_ALPACA_HOST and config.yaml's ingress/ports.
+readonly ALPACA_BIND_ADDRESS="0.0.0.0"
+readonly ALPACA_PORT=5555
+readonly IMAGING_PORT=7556
+readonly WEBUI_PORT=5432
+
+# --- helpers ------------------------------------------------------------------
+
+# Persist a name/value into the s6 container environment for later services.
+write_env() {
+    local name="${1}" value="${2}"
+    printf '%s' "${value}" > "${S6_ENV_DIR}/${name}"
+}
+
+# --- 1. MQTT resolution -------------------------------------------------------
+
+if bashio::config.is_empty 'mqtt_host'; then
+    if ! bashio::services.available 'mqtt'; then
+        bashio::exit.nok \
+            "No MQTT broker found: install the official Mosquitto add-on (so the " \
+            "Supervisor MQTT service is available) or set the mqtt_host/mqtt_port/" \
+            "mqtt_username/mqtt_password options to point at your own broker."
+    fi
+    bashio::log.info "Using the Supervisor MQTT service (Mosquitto add-on)."
+    write_env 'MQTT_HOST' "$(bashio::services 'mqtt' 'host')"
+    write_env 'MQTT_PORT' "$(bashio::services 'mqtt' 'port')"
+    write_env 'MQTT_USERNAME' "$(bashio::services 'mqtt' 'username')"
+    write_env 'MQTT_PASSWORD' "$(bashio::services 'mqtt' 'password')"
+    write_env 'MQTT_SSL' "$(bashio::services 'mqtt' 'ssl')"
+else
+    bashio::log.info "Using the operator-supplied MQTT host '$(bashio::config 'mqtt_host')'."
+fi
+
+# --- 2. Telescope source validation ------------------------------------------
+
+# bashio::config.has_value is false for both an absent key and an empty list
+# (an empty array yields no output), so it cleanly distinguishes "scopes set".
+has_scopes=false
+if bashio::config.has_value 'scopes'; then
+    has_scopes=true
+fi
+
+has_alpaca_host=false
+if bashio::config.has_value 'alpaca_host'; then
+    has_alpaca_host=true
+fi
+
+if [ "${has_scopes}" = true ] && [ "${has_alpaca_host}" = true ]; then
+    bashio::exit.nok \
+        "Both 'scopes' and 'alpaca_host' are set. Choose one: list your telescopes " \
+        "under 'scopes' to use the bundled driver, OR set 'alpaca_host' to reuse an " \
+        "existing seestar_alp (and leave 'scopes' empty)."
+fi
+
+if [ "${has_scopes}" = false ] && [ "${has_alpaca_host}" = false ]; then
+    bashio::exit.nok \
+        "No telescope configured. Add at least one entry under 'scopes' (bundled " \
+        "driver) or set 'alpaca_host' to an external seestar_alp (host:port)."
+fi
+
+# --- 3. Bundled-mode config.toml render --------------------------------------
+
+if [ "${has_alpaca_host}" = true ]; then
+    bashio::log.info "External Alpaca driver '$(bashio::config 'alpaca_host')'; not rendering config.toml."
+    exit 0
+fi
+
+bashio::log.info "Rendering bundled seestar_alp config.toml for $(bashio::config 'scopes | length') scope(s)."
+mkdir -p "$(dirname "${CONFIG_TOML_PATH}")"
+
+{
+    # Bind to all interfaces so the bridge reaches Alpaca by container DNS and
+    # the imaging/web-UI ports are reachable through ingress + the published port.
+    echo "[network]"
+    echo "ip_address = '${ALPACA_BIND_ADDRESS}'"
+    echo "port = ${ALPACA_PORT}"
+    echo "imgport = ${IMAGING_PORT}"
+    echo ""
+    echo "[webui_settings]"
+    echo "uiport = ${WEBUI_PORT}"
+    echo ""
+    # Surface the driver's logs in the add-on log stream (default is a file).
+    echo "[logging]"
+    echo "log_to_stdout = true"
+} > "${CONFIG_TOML_PATH}"
+
+# Escape backslashes and double-quotes so an operator-supplied value can't break
+# out of the TOML basic string it is embedded in.
+toml_escape() {
+    local value="${1}"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    printf '%s' "${value}"
+}
+
+# One [[seestars]] block per configured scope. device_num is 1-based and stable
+# across restarts; it is the Alpaca DeviceNumber the bridge enumerates and the
+# bridge's stable device id is the slug of `name` (never the rotating UniqueID).
+device_num=1
+for index in $(bashio::config 'scopes|keys'); do
+    name="$(bashio::config "scopes[${index}].name")"
+    host="$(bashio::config "scopes[${index}].host")"
+    {
+        echo ""
+        echo "[[seestars]]"
+        echo "name = \"$(toml_escape "${name}")\""
+        echo "ip_address = \"$(toml_escape "${host}")\""
+        echo "device_num = ${device_num}"
+    } >> "${CONFIG_TOML_PATH}"
+    bashio::log.info "  scope ${device_num}: '${name}' -> ${host}"
+    device_num=$((device_num + 1))
+done
+
+bashio::log.info "Wrote ${CONFIG_TOML_PATH}."

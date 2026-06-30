@@ -1,0 +1,23 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# ==============================================================================
+# seestar-alp longrun — the bundled Alpaca driver.
+#
+# Conditional: it runs ONLY in bundled mode (the alpaca_host option blank). In
+# external mode the operator reuses their own seestar_alp, so this service must
+# be a no-op — it brings ITSELF down once (s6-svc -O) instead of running, so s6
+# does not restart-loop it. init-config has already validated that exactly one of
+# scopes/alpaca_host is set and (in bundled mode) written config.toml.
+# ==============================================================================
+
+if bashio::config.has_value 'alpaca_host'; then
+    bashio::log.info \
+        "External Alpaca driver configured; bundled seestar_alp will not start."
+    # Bring this longrun down a single time (no restart). s6 runs this script
+    # with the service directory as CWD, so '.' targets this service.
+    exec /run/s6/basedir/bin/s6-svc -O .
+fi
+
+bashio::log.info "Starting bundled seestar_alp driver."
+cd /app/seestar_alp || bashio::exit.nok "seestar_alp directory missing from image."
+exec python3 root_app.py
