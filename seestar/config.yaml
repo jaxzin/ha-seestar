@@ -1,0 +1,75 @@
+# Home Assistant app manifest for "Seestar for Home Assistant".
+#
+# Bundles the seestar_alp Alpaca driver + the seestar_bridge telemetry publisher
+# in one container (two s6-supervised processes). Options below drive MQTT
+# resolution, the conditional bundled driver, and per-scope discovery; their keys
+# match seestar_bridge.settings.load_settings verbatim. The Supervisor reads the
+# image from GHCR ({arch} is substituted per architecture).
+name: Seestar for Home Assistant
+slug: seestar
+version: "1.0.0"
+description: >-
+  Live Seestar imaging telemetry + a stacked-image preview in Home Assistant via
+  MQTT discovery. Bundles the seestar_alp driver, or reuses your own.
+url: https://github.com/jaxzin/ha-seestar
+arch:
+  - aarch64
+  - amd64
+
+# The image has its own init system (s6-overlay v3), so the Docker default init
+# must be disabled (required for s6 v3 or the app won't start).
+init: false
+
+# Web UI: the bundled seestar_alp SSC interface, surfaced in the HA sidebar.
+ingress: true
+ingress_port: 5432
+
+# Imaging API port the scope streams stacked frames on; published so an external
+# client can reach it. null = mapped to a host port the Supervisor chooses.
+ports:
+  "7556/tcp": null
+ports_description:
+  "7556/tcp": seestar_alp imaging API (bundled mode)
+
+# Resolve the broker from the Supervisor MQTT service when mqtt_host is blank.
+services:
+  - mqtt:want
+
+# Prebuilt multi-arch image; {arch} is substituted by the Supervisor.
+image: ghcr.io/jaxzin/ha-seestar-{arch}
+
+options:
+  scopes: []
+  alpaca_host: ""
+  alpaca_webui_port: 5432
+  mqtt_host: ""
+  mqtt_port: 0
+  mqtt_username: ""
+  mqtt_password: ""
+  mqtt_ssl: false
+  discovery_prefix: homeassistant
+  event_poll_sec: 10
+  state_poll_sec: 30
+  preview_max_px: 1280
+  log_level: info
+
+schema:
+  # Bundled mode only: one HA device per entry; seeds seestar_alp's config.toml.
+  scopes:
+    - name: str
+      host: str
+  # Blank = bundled driver; else host:port of your own seestar_alp.
+  alpaca_host: str?
+  # External mode: the seestar_alp web-UI port discovery reads /config from.
+  alpaca_webui_port: port
+  # MQTT overrides; blank/0 = use the Supervisor (Mosquitto add-on) service.
+  mqtt_host: str?
+  mqtt_port: port
+  mqtt_username: str?
+  mqtt_password: password?
+  mqtt_ssl: bool
+  discovery_prefix: str
+  event_poll_sec: int(1,3600)
+  state_poll_sec: int(1,3600)
+  preview_max_px: int(256,4096)
+  log_level: list(trace|debug|info|notice|warning|error|fatal)
