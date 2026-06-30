@@ -29,6 +29,18 @@ DEFAULT_MQTT_PORT = 1883
 # is rejected so a typo fails fast instead of silently degrading to a default.
 VALID_LOG_LEVELS = ("trace", "debug", "info", "notice", "warning", "error", "fatal")
 
+# The HA add-on log_level convention (bashio) offers three levels that are NOT
+# stdlib ``logging`` level names: ``trace`` and ``notice`` don't exist there, and
+# ``fatal`` is only an alias HA uses by convention. Map each onto the nearest
+# stdlib level so ``getattr(logging, NAME)`` resolves for every schema value
+# instead of silently falling back to INFO. Levels already valid in ``logging``
+# (debug/info/warning/error) map to themselves.
+_HA_TO_PYTHON_LEVEL = {
+    "trace": "debug",
+    "notice": "info",
+    "fatal": "critical",
+}
+
 # Bundled seestar_alp binds Alpaca + the web UI to these ports (see config.toml /
 # the init-config oneshot). In external mode the Alpaca port comes from
 # ``alpaca_host`` and only the web-UI port keeps this default.
@@ -108,6 +120,19 @@ def _resolve_log_level(value):
             f"Invalid log_level '{value}': choose one of {', '.join(VALID_LOG_LEVELS)}."
         )
     return level
+
+
+def python_log_level(level):
+    """Map a resolved (lowercase) log level to a stdlib ``logging`` level name.
+
+    ``trace``/``notice``/``fatal`` are HA-convention levels with no stdlib
+    counterpart of the same name, so ``getattr(logging, "TRACE")`` would miss and
+    callers would silently fall back to INFO. Translate those to the nearest real
+    level (``debug``/``info``/``critical``); every other value is already a valid
+    ``logging`` name and passes through unchanged. Returned UPPERCASE, ready for
+    ``getattr(logging, ...)`` and the upstream driver's ``[logging] log_level``.
+    """
+    return _HA_TO_PYTHON_LEVEL.get(level, level).upper()
 
 
 def _resolve_mqtt(options, env):

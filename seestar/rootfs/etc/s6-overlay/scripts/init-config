@@ -95,8 +95,17 @@ mkdir -p "$(dirname "${CONFIG_TOML_PATH}")"
 
 # seestar_alp reads [logging] log_level verbatim (uppercase, via
 # logging.getLevelName); mirror the bridge's log_level option so the bundled
-# driver honors it too. Default to INFO when the option is blank.
-log_level_upper="$(bashio::config 'log_level' 'info' | tr '[:lower:]' '[:upper:]')"
+# driver honors it too. The HA-convention levels trace/notice/fatal have no
+# stdlib logging name, so map them onto the nearest real level (mirrors
+# settings.python_log_level) before uppercasing — otherwise getLevelName('TRACE')
+# misses and the driver degrades to its own default. Default to INFO when blank.
+log_level_raw="$(bashio::config 'log_level' 'info' | tr '[:upper:]' '[:lower:]')"
+case "${log_level_raw}" in
+    trace) log_level_raw='debug' ;;
+    notice) log_level_raw='info' ;;
+    fatal) log_level_raw='critical' ;;
+esac
+log_level_upper="$(printf '%s' "${log_level_raw}" | tr '[:lower:]' '[:upper:]')"
 
 {
     # Bind to all interfaces so the bridge reaches Alpaca by container DNS and

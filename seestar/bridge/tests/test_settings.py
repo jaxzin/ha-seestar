@@ -1,6 +1,11 @@
 import pytest
 
-from seestar_bridge.settings import MqttSettings, Settings, load_settings
+from seestar_bridge.settings import (
+    MqttSettings,
+    Settings,
+    load_settings,
+    python_log_level,
+)
 
 
 def _mqtt_env():
@@ -140,3 +145,37 @@ def test_log_level_invalid_rejected():
     options = {"scopes": [{"name": "Backyard"}], "log_level": "verbose"}
     with pytest.raises(ValueError, match="log_level"):
         load_settings(options, _mqtt_env())
+
+
+@pytest.mark.parametrize("ha_level", ["trace", "debug", "info", "notice", "warning", "error", "fatal"])
+def test_ha_level_options_are_all_accepted(ha_level):
+    # Every value in the config.yaml log_level enum must load (lowercased into
+    # Settings) rather than being rejected as an invalid level.
+    options = {"scopes": [{"name": "Backyard"}], "log_level": ha_level}
+    s = load_settings(options, _mqtt_env())
+
+    assert s.log_level == ha_level
+
+
+def test_python_log_level_maps_ha_only_levels():
+    # The HA-convention levels with no stdlib name resolve to the nearest real one
+    # (uppercased for getattr(logging, ...) / the driver's [logging] log_level).
+    assert python_log_level("trace") == "DEBUG"
+    assert python_log_level("notice") == "INFO"
+    assert python_log_level("fatal") == "CRITICAL"
+
+
+@pytest.mark.parametrize("level", ["debug", "info", "warning", "error"])
+def test_python_log_level_passes_through_stdlib_levels(level):
+    # Levels that are already valid logging names map to themselves (uppercased).
+    assert python_log_level(level) == level.upper()
+
+
+def test_python_log_level_resolves_to_a_real_logging_level():
+    # End-to-end guard: every config.yaml enum value, once mapped, is a real
+    # logging level (so getattr(logging, NAME) won't silently fall back to INFO).
+    import logging
+
+    for ha_level in ("trace", "debug", "info", "notice", "warning", "error", "fatal"):
+        name = python_log_level(ha_level)
+        assert isinstance(getattr(logging, name), int)

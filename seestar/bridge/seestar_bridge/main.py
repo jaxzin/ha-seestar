@@ -24,7 +24,7 @@ from .discovery import discover_addresses
 from .entities import slug
 from .mqtt import build_client
 from .scope import ScopeWorker
-from .settings import Settings, load_settings
+from .settings import Settings, load_settings, python_log_level
 
 _log = logging.getLogger(__name__)
 
@@ -153,9 +153,11 @@ def build_workers(alpaca, settings: Settings, mqtt_client) -> list[ScopeWorker]:
 def main() -> None:
     """Compose the real pieces and run a worker thread per scope (blocks forever)."""
     settings = load_settings(_options(), dict(os.environ))
-    # Honor the operator's log_level option; an unknown stdlib level (e.g. the
-    # bashio-only 'trace'/'notice') falls back to INFO rather than erroring.
-    level = getattr(logging, settings.log_level.upper(), logging.INFO)
+    # Honor the operator's log_level option. The HA-convention levels that have no
+    # stdlib name (trace/notice/fatal) are mapped to their nearest real level by
+    # python_log_level, so every config.yaml enum value takes effect end-to-end
+    # instead of silently degrading to INFO.
+    level = getattr(logging, python_log_level(settings.log_level), logging.INFO)
     logging.basicConfig(level=level, format=_LOG_FORMAT)
 
     # Device 0 is a placeholder for the management enumeration call; per-scope
