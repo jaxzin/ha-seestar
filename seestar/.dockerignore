@@ -1,0 +1,13 @@
+# Keep the build context lean and reproducible: the image installs the bridge's
+# runtime deps from the hashed bridge/requirements.txt, so dev/test/cache cruft
+# and the uv lock are not needed inside the image.
+bridge/.venv
+**/.venv
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.ruff_cache
+**/.git
+**/.env
+**/options.json
+bridge/uv.lock

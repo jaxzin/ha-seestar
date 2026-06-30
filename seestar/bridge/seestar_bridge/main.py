@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import threading
+import time
 
 from .alpaca import Alpaca
 from .discovery import discover_addresses
@@ -32,6 +33,15 @@ _DEVICE_NUMBER_KEY = "DeviceNumber"
 
 _MQTT_KEEPALIVE_SEC = 60
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+#: In bundled mode the bridge and the seestar_alp driver start concurrently under
+#: s6, so the first ``configureddevices`` enumeration can hit a not-yet-bound
+#: :5555 and raise ConnectionRefused. Retry the enumeration on connection errors
+#: with a bounded backoff rather than crash-looping the always-on bridge. We do
+#: NOT add a hard s6 bridge->seestar-alp dependency, which would couple the bridge
+#: to the conditionally-downed driver.
+_ALPACA_ENUMERATE_RETRY_SEC = 3
+_ALPACA_ENUMERATE_TIMEOUT_SEC = 60
 
 #: Process-level liveness topic shared by every scope. The broker publishes
 #: ``offline`` here (the Last-Will) if the bridge dies, and main publishes
@@ -73,6 +83,36 @@ def assign_device_ids(devices: list[dict]) -> dict[int, str]:
     return device_ids
 
 
+def enumerate_devices(
+    alpaca,
+    *,
+    retry_sec: float = _ALPACA_ENUMERATE_RETRY_SEC,
+    timeout_sec: float = _ALPACA_ENUMERATE_TIMEOUT_SEC,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+) -> list[dict]:
+    """Enumerate Alpaca devices, retrying on connection errors within a window.
+
+    In bundled mode the driver may not have bound :5555 yet when the bridge starts,
+    so :meth:`Alpaca.configured_devices` can raise ``ConnectionRefused`` (surfaced
+    as ``URLError``, an ``OSError`` subclass). Retry every ``retry_sec`` until the
+    driver answers or ``timeout_sec`` elapses, logging at info instead of crashing
+    on a traceback. Non-connection errors (and a timeout) propagate so genuine
+    misconfiguration still fails loudly.
+    """
+    deadline = monotonic() + timeout_sec
+    while True:
+        try:
+            return alpaca.configured_devices() or []
+        except OSError as exc:  # URLError (connection refused) is an OSError
+            if monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Alpaca driver did not come up within {timeout_sec:.0f}s: {exc}"
+                ) from exc
+            _log.info("waiting for the Alpaca driver to come up... (%s)", exc)
+            sleep(retry_sec)
+
+
 def build_workers(alpaca, settings: Settings, mqtt_client) -> list[ScopeWorker]:
     """Enumerate scopes, publish discovery, and return a worker per scope.
 
@@ -81,7 +121,7 @@ def build_workers(alpaca, settings: Settings, mqtt_client) -> list[ScopeWorker]:
     publishes retained MQTT discovery for every scope, and constructs (but does
     not start) one :class:`ScopeWorker` each.
     """
-    devices = alpaca.configured_devices() or []
+    devices = enumerate_devices(alpaca)
     device_ids = assign_device_ids(devices)
     addresses = discover_addresses(
         config_toml_path=settings.config_toml_path,
@@ -112,8 +152,11 @@ def build_workers(alpaca, settings: Settings, mqtt_client) -> list[ScopeWorker]:
 
 def main() -> None:
     """Compose the real pieces and run a worker thread per scope (blocks forever)."""
-    logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT)
     settings = load_settings(_options(), dict(os.environ))
+    # Honor the operator's log_level option; an unknown stdlib level (e.g. the
+    # bashio-only 'trace'/'notice') falls back to INFO rather than erroring.
+    level = getattr(logging, settings.log_level.upper(), logging.INFO)
+    logging.basicConfig(level=level, format=_LOG_FORMAT)
 
     # Device 0 is a placeholder for the management enumeration call; per-scope
     # Alpaca clients (bound to the real device numbers) are built in build_workers.

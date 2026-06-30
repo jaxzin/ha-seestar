@@ -8,7 +8,10 @@ at least one state publish — not just the pure ``build_state``.
 """
 import json
 import threading
+import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import pytest
 
 import seestar_bridge.main as main_mod
 from seestar_bridge.entities import ENTITIES
@@ -16,6 +19,7 @@ from seestar_bridge.main import (
     BRIDGE_AVAILABILITY_TOPIC,
     assign_device_ids,
     build_workers,
+    enumerate_devices,
 )
 from seestar_bridge.settings import MqttSettings, Settings
 
@@ -84,6 +88,7 @@ def _settings(alpaca_base):
         event_poll_sec=10,
         state_poll_sec=30,
         preview_max_px=1280,
+        log_level="info",
         mqtt=MqttSettings(host="broker", port=1883, username="", password="", ssl=False),
     )
 
@@ -179,6 +184,75 @@ def test_main_wires_bridge_lwt_and_publishes_online(monkeypatch):
     assert calls["will_payload"] == "offline"
     online = [(t, p, r) for t, p, r in mqtt_client.published if t == BRIDGE_AVAILABILITY_TOPIC]
     assert online == [(BRIDGE_AVAILABILITY_TOPIC, "online", True)]
+
+
+class _FlakyAlpaca:
+    """configured_devices() raises a connection error N times, then succeeds."""
+
+    def __init__(self, fail_times, exc, result):
+        self._remaining = fail_times
+        self._exc = exc
+        self._result = result
+        self.calls = 0
+
+    def configured_devices(self):
+        self.calls += 1
+        if self._remaining > 0:
+            self._remaining -= 1
+            raise self._exc
+        return self._result
+
+
+def test_enumerate_devices_retries_then_recovers():
+    # Bundled cold-start: the driver hasn't bound :5555 yet, so the first
+    # enumeration raises a connection error; the bounded retry recovers once the
+    # driver answers, rather than crash-looping the always-on bridge.
+    refused = urllib.error.URLError(ConnectionRefusedError("connection refused"))
+    alpaca = _FlakyAlpaca(fail_times=2, exc=refused, result=DEVICES)
+    sleeps = []
+
+    devices = enumerate_devices(
+        alpaca,
+        retry_sec=3,
+        timeout_sec=60,
+        sleep=sleeps.append,
+        monotonic=_fake_clock([0.0, 0.0, 3.0, 6.0]),
+    )
+
+    assert devices == DEVICES
+    assert alpaca.calls == 3  # two failures + one success
+    assert sleeps == [3, 3]  # backed off once per failure
+
+
+def test_enumerate_devices_gives_up_after_timeout():
+    # If the driver never comes up within the window, give up with a clear error
+    # instead of retrying forever.
+    refused = urllib.error.URLError(ConnectionRefusedError("connection refused"))
+    alpaca = _FlakyAlpaca(fail_times=99, exc=refused, result=DEVICES)
+
+    with pytest.raises(TimeoutError, match="did not come up"):
+        enumerate_devices(
+            alpaca,
+            retry_sec=3,
+            timeout_sec=60,
+            sleep=lambda _s: None,
+            monotonic=_fake_clock([0.0, 0.0, 61.0]),
+        )
+
+
+def _fake_clock(values):
+    """A monotonic() stand-in returning the given values in order, then the last."""
+    iterator = iter(values)
+    last = [values[-1]]
+
+    def clock():
+        try:
+            last[0] = next(iterator)
+        except StopIteration:
+            pass
+        return last[0]
+
+    return clock
 
 
 def _alpaca(base):
