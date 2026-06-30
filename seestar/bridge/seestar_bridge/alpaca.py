@@ -43,15 +43,10 @@ class Alpaca:
         """Peel seestar_alp's nesting off an Alpaca ``Value``.
 
         ``method_sync`` wraps its payload as ``{"method": ..., "result": ...}``;
-        unwrap that when the result is itself structured. Some calls return a
-        single-numeric-key dict keyed by device number — unwrap that too.
+        unwrap that when the result is itself structured.
         """
         if isinstance(value, dict) and "result" in value and isinstance(value["result"], (dict, list)):
             value = value["result"]
-        if isinstance(value, dict) and len(value) == 1:
-            only = next(iter(value))
-            if str(only).isdigit() and isinstance(value[only], dict):
-                value = value[only]
         return value
 
     def action(self, name, params=None):
