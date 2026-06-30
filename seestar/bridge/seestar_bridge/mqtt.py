@@ -30,12 +30,19 @@ _RECONNECT_MAX_DELAY_SEC = 30
 _CLIENT_ID_PREFIX = "seestar-bridge"
 
 
-def build_client(mqtt_settings: MqttSettings, *, will_topic: str | None = None) -> mqtt.Client:
+def build_client(
+    mqtt_settings: MqttSettings,
+    *,
+    will_topic: str | None = None,
+    will_payload: str = _PAYLOAD_NOT_AVAILABLE,
+) -> mqtt.Client:
     """Build (but do not connect) a paho client from resolved MQTT settings.
 
     TLS uses the system CA store (``CERT_REQUIRED``); ``ssl=False`` connects in
     the clear (typical for the in-cluster Mosquitto add-on). When ``will_topic``
-    is given, the client registers a retained ``offline`` LWT on it.
+    is given, the client registers a retained Last-Will on it (``will_payload``,
+    defaulting to ``offline``), so the broker marks the bridge offline if the
+    process dies without a clean disconnect.
     """
     client = mqtt.Client(
         mqtt.CallbackAPIVersion.VERSION2,
@@ -46,7 +53,7 @@ def build_client(mqtt_settings: MqttSettings, *, will_topic: str | None = None) 
     if mqtt_settings.ssl:
         client.tls_set(cert_reqs=ssl.CERT_REQUIRED)
     if will_topic:
-        client.will_set(will_topic, _PAYLOAD_NOT_AVAILABLE, retain=True)
+        client.will_set(will_topic, will_payload, retain=True)
     client.reconnect_delay_set(
         min_delay=_RECONNECT_MIN_DELAY_SEC, max_delay=_RECONNECT_MAX_DELAY_SEC)
     return client

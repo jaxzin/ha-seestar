@@ -70,6 +70,24 @@ def test_get_returns_value():
     srv.shutdown()
 
 
+def test_is_connected_true_when_value_true():
+    srv, base = _serve({"/api/v1/telescope/1/connected": {"Value": True}})
+    assert Alpaca(base, 1).is_connected() is True
+    srv.shutdown()
+
+
+def test_is_connected_false_when_value_false():
+    srv, base = _serve({"/api/v1/telescope/1/connected": {"Value": False}})
+    assert Alpaca(base, 1).is_connected() is False
+    srv.shutdown()
+
+
+def test_is_connected_false_on_error():
+    # Any transport error (nothing listening) is treated as disconnected, not
+    # propagated, so the Connected sensor reads OFF instead of aborting the loop.
+    assert Alpaca("http://127.0.0.1:1", 1).is_connected() is False
+
+
 def test_configured_devices_returns_list():
     srv, base = _serve({"/management/v1/configureddevices": {"Value": [{"DeviceName": "Seestar S30 Pro", "DeviceNumber": 1}]}})
     assert Alpaca(base, 1).configured_devices()[0]["DeviceNumber"] == 1

@@ -11,7 +11,11 @@ real payload; we surface that as ``TimeoutError`` so callers can back off rather
 than treat it as data.
 """
 import json
+import logging
+import urllib.error
 import urllib.request
+
+_log = logging.getLogger(__name__)
 
 #: ASCOM requires ClientID / ClientTransactionID on every request. We use a
 #: single logical client and a monotonically increasing transaction id.
@@ -90,6 +94,25 @@ class Alpaca:
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode()).get("Value")
+
+    def is_connected(self, timeout=_HTTP_TIMEOUT_SEC):
+        """``GET /api/v1/telescope/{n}/connected`` — the scope's connection state.
+
+        Returns ``True`` only when seestar_alp reports the scope connected.
+        Any error (driver down, socket hang, malformed body) is treated as
+        ``False`` so the Connected binary_sensor reflects an unreachable scope
+        rather than aborting the poll loop. Ported from Phase-1 ``is_connected``.
+        """
+        try:
+            req = urllib.request.Request(
+                f"{self._base_url}/api/v1/telescope/{self._device_num}/connected"
+                f"?ClientID={_CLIENT_ID}&ClientTransactionID={self._next_txn()}"
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return bool(json.loads(resp.read().decode()).get("Value"))
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            _log.info("connected probe failed (device %s): %s", self._device_num, exc)
+            return False
 
     def configured_devices(self, timeout=_HTTP_TIMEOUT_SEC):
         """``GET /management/v1/configureddevices`` — the ``Value`` device list.
