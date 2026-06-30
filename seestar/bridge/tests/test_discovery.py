@@ -146,6 +146,21 @@ def test_json_404_falls_back_to_html_scrape(tmp_path):
     assert result == {1: "10.0.0.31", 2: "10.0.0.32"}
 
 
+def test_json_empty_200_falls_back_to_html_scrape(tmp_path):
+    # /config.json returns HTTP 200 but an empty device list; the empty-but-200
+    # result must fall through to the HTML scrape rather than short-circuit.
+    srv, base = _serve({"/config.json": {"devices": []}, "/config": CONFIG_HTML})
+    try:
+        result = discover_addresses(
+            config_toml_path=str(tmp_path / "missing.toml"),
+            webui_base=base,
+            devices=DEVICES,
+        )
+    finally:
+        srv.shutdown()
+    assert result == {1: "10.0.0.31", 2: "10.0.0.32"}
+
+
 def test_nothing_resolvable_returns_empty(tmp_path):
     # No toml, no webui at all -> empty, no raise.
     result = discover_addresses(
