@@ -20,6 +20,32 @@ from typing import Any, NamedTuple
 _COMPONENT_BINARY_SENSOR = "binary_sensor"
 _COMPONENT_SENSOR = "sensor"
 
+# ---- Phase-2 command (control) components. A command entity subscribes on a
+# command_topic; the stateful ones also publish to a state_topic.
+_COMPONENT_BUTTON = "button"
+_COMPONENT_SWITCH = "switch"
+_COMPONENT_SELECT = "select"
+_COMPONENT_NUMBER = "number"
+_COMPONENT_TEXT = "text"
+
+#: Components that carry persistent state (HA shows the live setting), so they
+#: get a state_topic in addition to the command_topic. A button is momentary and
+#: stateless.
+_STATEFUL_CONTROL_COMPONENTS = frozenset(
+    {_COMPONENT_SWITCH, _COMPONENT_SELECT, _COMPONENT_NUMBER, _COMPONENT_TEXT}
+)
+
+#: The command payload HA sends on a button press; the bridge treats any message
+#: on a button's command_topic as a trigger, but the discovery config still
+#: declares the expected press payload.
+_PAYLOAD_PRESS = "PRESS"
+
+#: Sub-topic under a scope's base topic that roots every command topic:
+#: ``seestar/<device_id>/cmd/<key>`` (and ``.../cmd/<key>/state`` for stateful
+#: controls). Kept distinct from the Phase-1 ``state`` sub-topic so the command
+#: path never collides with the telemetry snapshot.
+_CMD_SUBTOPIC = "cmd"
+
 _PAYLOAD_ON = "ON"
 _PAYLOAD_OFF = "OFF"
 _PAYLOAD_AVAILABLE = "online"
@@ -218,6 +244,157 @@ def discovery_payload(
         cfg["device_class"] = entity.device_class
     if entity.state_class:
         cfg["state_class"] = entity.state_class
+    if entity.icon:
+        cfg["icon"] = entity.icon
+    return cfg
+
+
+# ==== Phase-2 command (control) entities =========================================
+#
+# The command path: each control entity publishes discovery with a command_topic
+# the bridge SUBSCRIBES to; stateful ones (switch/select/number/text) also declare
+# a state_topic so HA reflects the live setting. Buttons are momentary and carry a
+# payload_press instead. The Phase-1 ENTITIES above are untouched.
+
+
+class ControlEntity(NamedTuple):
+    """One HA command entity in the control catalog.
+
+    ``component`` is one of button/switch/select/number/text. ``key`` roots the
+    command topic (``seestar/<device>/cmd/<key>``) and namespaces the
+    unique_id/object_id, exactly like the Phase-1 catalog. For a ``number`` the
+    min/max/step are emitted; for a ``select`` the options are; a ``text`` and a
+    ``switch`` carry neither. ``icon`` is optional metadata.
+    """
+
+    component: str
+    key: str
+    name: str
+    icon: str | None = None
+    min_value: float | None = None
+    max_value: float | None = None
+    step: float | None = None
+    options: tuple[str, ...] | None = None
+
+
+# Imaging modes offered by the Imaging-mode select (mirrors control._IMAGING_MODES;
+# the two are asserted disjoint-from-Phase-1 and consistent by the control tests).
+_IMAGING_MODES = ("star", "scenery", "planet", "sun", "moon")
+
+# The command catalog. Per the Phase-2 spec's "expose everything" directive, this
+# covers Session/imaging, Plans execution, and Power/position, PLUS the two
+# first-class safety switches. Param-carrying discrete actions pair a value entity
+# (select/number/text) with a trigger button that shares the action; both are
+# listed so HA renders the full surface.
+CONTROL_ENTITIES: list[ControlEntity] = [
+    # -- Safety switches (both default OFF; gate all/power commands) --
+    ControlEntity(_COMPONENT_SWITCH, "controls_enabled", "Controls enabled",
+                  "mdi:lock-open-check"),
+    ControlEntity(_COMPONENT_SWITCH, "allow_power", "Allow power actions",
+                  "mdi:power-settings"),
+    # -- Session / imaging --
+    ControlEntity(_COMPONENT_SELECT, "start_live_view", "Start live view",
+                  "mdi:play-box", options=_IMAGING_MODES),
+    ControlEntity(_COMPONENT_SELECT, "imaging_mode", "Imaging mode",
+                  "mdi:camera-iris", options=_IMAGING_MODES),
+    ControlEntity(_COMPONENT_BUTTON, "start_stack", "Start stacking",
+                  "mdi:layers-plus"),
+    ControlEntity(_COMPONENT_BUTTON, "stop", "Stop", "mdi:stop"),
+    ControlEntity(_COMPONENT_BUTTON, "start_mosaic", "Start mosaic",
+                  "mdi:grid"),
+    ControlEntity(_COMPONENT_BUTTON, "start_spectra", "Start spectra",
+                  "mdi:chart-bell-curve"),
+    ControlEntity(_COMPONENT_TEXT, "goto", "Goto target", "mdi:crosshairs-gps"),
+    ControlEntity(_COMPONENT_BUTTON, "stop_goto", "Stop goto",
+                  "mdi:crosshairs-off"),
+    ControlEntity(_COMPONENT_NUMBER, "exposure", "Exposure", "mdi:camera-timer",
+                  min_value=1, max_value=600, step=1),
+    ControlEntity(_COMPONENT_NUMBER, "focus", "Focus", "mdi:focus-field",
+                  min_value=-500, max_value=500, step=1),
+    ControlEntity(_COMPONENT_NUMBER, "mag_declination", "Mag declination",
+                  "mdi:compass", min_value=-180, max_value=180, step=0.1),
+    # Keyed distinctly from the Phase-1 read-only ``dew_heater`` binary_sensor so
+    # the command switch's unique_id/topic never collides with the sensor's.
+    ControlEntity(_COMPONENT_SWITCH, "dew_heater_set", "Dew heater",
+                  "mdi:heating-coil"),
+    ControlEntity(_COMPONENT_SWITCH, "plate_solve_loop", "Plate-solve loop",
+                  "mdi:image-filter-center-focus"),
+    # -- Plans (execution only) --
+    ControlEntity(_COMPONENT_TEXT, "run_plan", "Run plan", "mdi:play-circle"),
+    ControlEntity(_COMPONENT_BUTTON, "pause_plan", "Pause plan", "mdi:pause"),
+    ControlEntity(_COMPONENT_BUTTON, "continue_plan", "Continue plan",
+                  "mdi:play"),
+    ControlEntity(_COMPONENT_BUTTON, "skip_target", "Skip current target",
+                  "mdi:skip-next"),
+    ControlEntity(_COMPONENT_BUTTON, "reset_item", "Reset current item",
+                  "mdi:restart"),
+    # -- Power / position (behind Allow power actions) --
+    ControlEntity(_COMPONENT_BUTTON, "startup", "Startup sequence",
+                  "mdi:power"),
+    ControlEntity(_COMPONENT_BUTTON, "park", "Park", "mdi:home-import-outline"),
+    ControlEntity(_COMPONENT_BUTTON, "shutdown", "Shutdown", "mdi:power-off"),
+]
+
+
+def command_topic(base_topic: str, key: str) -> str:
+    """The command topic the bridge subscribes to for one control key."""
+    return f"{base_topic}/{_CMD_SUBTOPIC}/{key}"
+
+
+def control_state_topic(base_topic: str, key: str) -> str:
+    """The state topic a stateful control publishes its current value on."""
+    return f"{command_topic(base_topic, key)}/{_STATE_SUBTOPIC}"
+
+
+def control_discovery_payload(
+    entity: ControlEntity,
+    *,
+    device_block: dict[str, Any],
+    base_topic: str,
+    bridge_availability_topic: str,
+) -> dict[str, Any]:
+    """Build the MQTT discovery config for one command entity.
+
+    Every command entity gets a ``command_topic`` (``seestar/<device>/cmd/<key>``)
+    the bridge subscribes to. Stateful controls (switch/select/number/text) also
+    get a ``state_topic`` so HA shows the live setting; a button is momentary and
+    instead declares ``payload_press``. The availability list + device block reuse
+    the Phase-1 logic (same two-topic ``all`` mode ANDing bridge liveness with
+    scope reachability), so a command entity greys out exactly when its sensors do.
+    Number range (min/max/step) and select options are emitted only for those
+    components.
+    """
+    device_id = device_block["identifiers"][0]
+    cmd_topic = command_topic(base_topic, entity.key)
+    scope_availability_topic = f"{base_topic}/{_AVAILABILITY_SUBTOPIC}"
+
+    cfg: dict[str, Any] = {
+        "name": entity.name,
+        "unique_id": f"{device_id}_{entity.key}",
+        "object_id": f"{device_id}_{entity.key}",
+        "command_topic": cmd_topic,
+        "availability": availability_list(bridge_availability_topic, scope_availability_topic),
+        "availability_mode": _AVAILABILITY_MODE_ALL,
+        "device": device_block,
+    }
+    if entity.component in _STATEFUL_CONTROL_COMPONENTS:
+        cfg["state_topic"] = control_state_topic(base_topic, entity.key)
+    if entity.component == _COMPONENT_BUTTON:
+        cfg["payload_press"] = _PAYLOAD_PRESS
+    if entity.component == _COMPONENT_SWITCH:
+        cfg["payload_on"] = _PAYLOAD_ON
+        cfg["payload_off"] = _PAYLOAD_OFF
+        cfg["state_on"] = _PAYLOAD_ON
+        cfg["state_off"] = _PAYLOAD_OFF
+    if entity.component == _COMPONENT_NUMBER:
+        if entity.min_value is not None:
+            cfg["min"] = entity.min_value
+        if entity.max_value is not None:
+            cfg["max"] = entity.max_value
+        if entity.step is not None:
+            cfg["step"] = entity.step
+    if entity.component == _COMPONENT_SELECT and entity.options is not None:
+        cfg["options"] = list(entity.options)
     if entity.icon:
         cfg["icon"] = entity.icon
     return cfg

@@ -31,8 +31,10 @@ from typing import Any
 
 from .altaz import radec_to_altaz
 from .entities import (
+    CONTROL_ENTITIES,
     ENTITIES,
     availability_list,
+    control_discovery_payload,
     device_block,
     discovery_payload,
     slug,
@@ -412,6 +414,17 @@ class ScopeWorker:
             topic = f"{prefix}/{entity.component}/{self._device_id}/{entity.key}/config"
             payload = discovery_payload(
                 entity,
+                device_block=block,
+                base_topic=self.base_topic,
+                bridge_availability_topic=self._bridge_availability_topic,
+            )
+            self._mqtt.publish(topic, json.dumps(payload), retain=True)
+        # Phase-2 command entities: same per-scope device, each with a
+        # command_topic the bridge subscribes to (subscription is wired in run()).
+        for control in CONTROL_ENTITIES:
+            topic = f"{prefix}/{control.component}/{self._device_id}/{control.key}/config"
+            payload = control_discovery_payload(
+                control,
                 device_block=block,
                 base_topic=self.base_topic,
                 bridge_availability_topic=self._bridge_availability_topic,
