@@ -1,6 +1,8 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.ruff_cache/
+*.egg-info/
 .venv/
 
 # Operator-created docker-compose config (copied from examples/, may hold secrets)
