@@ -22,7 +22,7 @@ import time
 from .alpaca import Alpaca
 from .discovery import discover_addresses
 from .entities import slug
-from .mqtt import build_client
+from .mqtt import COMMAND_QOS, build_client, set_router
 from .scope import ScopeWorker
 from .settings import Settings, load_settings, python_log_level
 
@@ -150,6 +150,46 @@ def build_workers(alpaca, settings: Settings, mqtt_client) -> list[ScopeWorker]:
     return workers
 
 
+def make_command_router(workers: list[ScopeWorker]):
+    """Build the ``(topic, payload)`` router that fans commands to owning workers.
+
+    The shared MQTT client subscribes to every scope's ``cmd/#`` filter, so all
+    scopes' commands arrive on one ``on_message``. The returned router hands each
+    message to the SINGLE worker that owns the topic (matched by its per-scope base
+    topic) and to no other — the load-bearing per-scope isolation: a command for
+    device A can only ever reach device A's worker. An unowned topic (e.g. a stray
+    publish) is logged and dropped rather than silently swallowed.
+    """
+    def route(topic: str, payload: str) -> None:
+        for worker in workers:
+            if worker.owns_topic(topic):
+                worker.handle_command(topic, payload)
+                return
+        _log.warning("command on %s matched no scope; dropping", topic)
+
+    return route
+
+
+def subscribe_commands(mqtt_client, workers: list[ScopeWorker]) -> None:
+    """Install the command router + subscribe the shared client to every scope.
+
+    Registers one ``on_connect``/``on_message`` pair (via :func:`mqtt.set_router`)
+    so the per-scope ``cmd/#`` filters are (re)subscribed on every connect and
+    reconnect. Because the caller connects the client BEFORE the workers exist,
+    ``on_connect`` has already fired for the initial link; we therefore also issue
+    the subscriptions once here so the running connection starts receiving commands
+    immediately, while ``on_connect`` covers all later reconnects. A run with no
+    workers registers nothing (there is nothing to command).
+    """
+    if not workers:
+        return
+    filters = [worker.command_topic_filter for worker in workers]
+    set_router(mqtt_client, make_command_router(workers), filters)
+    for topic_filter in filters:
+        mqtt_client.subscribe(topic_filter, qos=COMMAND_QOS)
+        _log.info("subscribed to command topics: %s", topic_filter)
+
+
 def main() -> None:
     """Compose the real pieces and run a worker thread per scope (blocks forever)."""
     settings = load_settings(_options(), dict(os.environ))
@@ -178,6 +218,13 @@ def main() -> None:
     workers = build_workers(alpaca, settings, mqtt_client)
     if not workers:
         _log.warning("no scopes enumerated from Alpaca; nothing to publish")
+
+    # Wire the command (subscribe) path: route each inbound command to its owning
+    # worker, and install the shared client's on_connect so every scope's cmd/#
+    # filter is (re)subscribed on connect AND reconnect. The initial CONNECT above
+    # already fired before the workers existed, so subscribe once here explicitly;
+    # the on_connect handler then covers every subsequent reconnect.
+    subscribe_commands(mqtt_client, workers)
 
     threads = []
     for worker in workers:

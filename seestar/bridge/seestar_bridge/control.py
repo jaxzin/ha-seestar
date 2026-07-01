@@ -266,6 +266,16 @@ CONTROLS: list[Control] = [
 _CONTROLS_BY_KEY: dict[str, Control] = {ctl.key: ctl for ctl in CONTROLS}
 
 
+def control_for(control_key: str) -> Control | None:
+    """Look up a dispatch-catalog :class:`Control` by key, or ``None`` if unknown.
+
+    Public accessor over the by-key index so the scope worker can ask whether a
+    dispatched control is stateful (to decide whether to echo its value to HA)
+    without reaching into module internals or re-scanning :data:`CONTROLS`.
+    """
+    return _CONTROLS_BY_KEY.get(control_key)
+
+
 # -- validation ------------------------------------------------------------------
 
 

@@ -29,12 +29,15 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+from . import control
 from .altaz import radec_to_altaz
+from .control import DispatchStatus
 from .entities import (
     CONTROL_ENTITIES,
     ENTITIES,
     availability_list,
     control_discovery_payload,
+    control_state_topic,
     device_block,
     discovery_payload,
     slug,
@@ -97,6 +100,37 @@ _CONNECTED_KEY = "connected"
 _CAMERA_COMPONENT = "camera"
 _CAMERA_KEY = "preview"
 _CAMERA_NAME = "Live stacked preview"
+
+# --- command (control) path constants ------------------------------------------
+
+#: Sub-topic under the base topic that roots every command topic
+#: (``seestar/<device>/cmd/<key>``). Kept in sync with ``entities._CMD_SUBTOPIC``;
+#: used to derive the per-scope subscription wildcard and to parse a control key
+#: back out of an inbound command topic.
+_CMD_SUBTOPIC = "cmd"
+_CMD_STATE_SUBTOPIC = "state"
+
+#: The two first-class safety switches. They are STATEFUL and per-worker (default
+#: OFF): they are never dispatched to Alpaca — instead they hold the gate state
+#: that ``control.dispatch`` consults for every OTHER command. ``controls_enabled``
+#: gates all commands; ``allow_power`` additionally gates the power actions.
+_CONTROLS_ENABLED_KEY = "controls_enabled"
+_ALLOW_POWER_KEY = "allow_power"
+_SAFETY_SWITCH_KEYS = frozenset({_CONTROLS_ENABLED_KEY, _ALLOW_POWER_KEY})
+
+#: HA switch command/state payloads (paho delivers the raw MQTT string).
+_SWITCH_ON = "ON"
+_SWITCH_OFF = "OFF"
+
+#: Keys of the control catalog that carry persistent state HA reflects (a
+#: dispatched value is echoed to their state_topic). Buttons are momentary and
+#: get no echo. Derived from the dispatch catalog so it can never drift from it.
+_STATEFUL_DISPATCH_COMPONENTS = frozenset({
+    control.COMPONENT_SWITCH,
+    control.COMPONENT_SELECT,
+    control.COMPONENT_NUMBER,
+    control.COMPONENT_TEXT,
+})
 
 # --- HTTP + backoff constants --------------------------------------------------
 
@@ -200,6 +234,11 @@ class ScopeWorker:
         # Observer location from the scope's own GPS; cached once, never published.
         self._site_lat: float | None = None
         self._site_lon: float | None = None
+        # Per-worker safety gate (both default OFF). These are the stateful safety
+        # switches; every command is gated on them via ``control.dispatch``. They
+        # are isolated per worker, so arming one scope never arms another.
+        self._controls_enabled = False
+        self._allow_power = False
 
     # -- identity / topics ------------------------------------------------------
 
@@ -222,6 +261,26 @@ class ScopeWorker:
     @property
     def preview_topic(self) -> str:
         return f"{self.base_topic}/{_PREVIEW_SUBTOPIC}"
+
+    @property
+    def command_topic_filter(self) -> str:
+        """MQTT wildcard covering every command topic this scope owns.
+
+        ``seestar/<device>/cmd/#`` — the orchestrator subscribes the shared client
+        to one such filter per scope. The trailing ``#`` deliberately also matches
+        the ``.../state`` echo topics; :meth:`handle_command` ignores those so a
+        retained state message we publish never loops back as a command.
+        """
+        return f"{self.base_topic}/{_CMD_SUBTOPIC}/#"
+
+    def owns_topic(self, topic: str) -> bool:
+        """True iff ``topic`` is a command topic under THIS scope's base topic.
+
+        The orchestrator routes an inbound command to the owning worker by asking
+        each worker whether it owns the topic. Per-scope isolation depends on this:
+        a command addressed to device A must never be handed to device B.
+        """
+        return topic.startswith(f"{self.base_topic}/{_CMD_SUBTOPIC}/")
 
     def set_site_location(self, lat: float, lon: float) -> None:
         """Cache the GPS site (deg) used to turn RA/Dec into Alt/Az."""
@@ -420,11 +479,13 @@ class ScopeWorker:
             )
             self._mqtt.publish(topic, json.dumps(payload), retain=True)
         # Phase-2 command entities: same per-scope device, each with a
-        # command_topic the bridge subscribes to (subscription is wired in run()).
-        for control in CONTROL_ENTITIES:
-            topic = f"{prefix}/{control.component}/{self._device_id}/{control.key}/config"
+        # command_topic the bridge subscribes to (subscription is wired by the
+        # orchestrator's subscribe_commands). ``control_entity`` avoids shadowing
+        # the ``control`` dispatch module imported at the top.
+        for control_entity in CONTROL_ENTITIES:
+            topic = f"{prefix}/{control_entity.component}/{self._device_id}/{control_entity.key}/config"
             payload = control_discovery_payload(
-                control,
+                control_entity,
                 device_block=block,
                 base_topic=self.base_topic,
                 bridge_availability_topic=self._bridge_availability_topic,
@@ -442,6 +503,124 @@ class ScopeWorker:
         }
         camera_topic = f"{prefix}/{_CAMERA_COMPONENT}/{self._device_id}/{_CAMERA_KEY}/config"
         self._mqtt.publish(camera_topic, json.dumps(camera), retain=True)
+        # Seed the two safety switches to a known, retained OFF so HA renders them
+        # correctly on a cold start (a switch with no retained state shows as
+        # unknown). This also encodes the fail-safe default: the gate is CLOSED
+        # until an operator explicitly arms it.
+        self._publish_safety_state()
+
+    def _publish_safety_state(self) -> None:
+        """Publish both safety switches' current gate state (retained) to HA.
+
+        Called once at discovery (seeding the retained OFF default) and again
+        whenever a safety switch is toggled, so HA always reflects the live gate.
+        """
+        self._publish_control_state(_CONTROLS_ENABLED_KEY, self._controls_enabled)
+        self._publish_control_state(_ALLOW_POWER_KEY, self._allow_power)
+
+    def _publish_control_state(self, key: str, value: Any) -> None:
+        """Publish one control's current value to its retained ``state_topic``.
+
+        ``bool`` values are rendered as the HA switch ``ON``/``OFF`` payloads; any
+        other value (a select mode, a number) is published as its string form so
+        HA reflects the live setting.
+        """
+        if isinstance(value, bool):
+            payload = _SWITCH_ON if value else _SWITCH_OFF
+        else:
+            payload = str(value)
+        self._mqtt.publish(control_state_topic(self.base_topic, key), payload, retain=True)
+
+    # -- command path -----------------------------------------------------------
+
+    def handle_command(self, topic: str, payload: str) -> None:
+        """Route one inbound command message for THIS scope's device.
+
+        Parses the control key from ``topic`` and either:
+
+        - **safety switch** (``controls_enabled`` / ``allow_power``): update the
+          per-worker gate state and re-publish it (retained) to the switch's
+          state_topic. These are NEVER dispatched to Alpaca — they only hold the
+          gate the other commands are checked against.
+        - **any other control**: hand it to :func:`control.dispatch` with the
+          CURRENT gate state, so no command reaches the scope unless the gate
+          allows it. A stateful control's new value is echoed to its state_topic
+          on success; a refusal or an Alpaca error is logged with its reason (the
+          dispatcher already logged it; the echo/notify is the operator surface).
+
+        A message on a control's own ``.../state`` echo topic (which the ``#``
+        subscription also matches) is ignored so our retained echoes never loop
+        back as commands. This method is defensive — it is invoked from the shared
+        MQTT network thread and must not raise into it — but the outer guard in
+        :func:`mqtt.set_router` is the ultimate backstop.
+        """
+        key = self._command_key(topic)
+        if key is None:
+            return  # a .../state echo or a malformed topic; not a command
+        if key in _SAFETY_SWITCH_KEYS:
+            self._apply_safety_switch(key, payload)
+            return
+        self._dispatch_control(key, payload)
+
+    def _command_key(self, topic: str) -> str | None:
+        """Extract the control key from a command topic, or ``None`` to ignore.
+
+        A concrete command topic is ``<base>/cmd/<key>``. The ``.../cmd/<key>/state``
+        echo topic (also matched by the ``#`` subscription) has an extra segment
+        and is deliberately ignored, as is any topic that isn't ours.
+        """
+        prefix = f"{self.base_topic}/{_CMD_SUBTOPIC}/"
+        if not topic.startswith(prefix):
+            return None
+        remainder = topic[len(prefix):]
+        if not remainder or "/" in remainder:
+            # Empty (``.../cmd/``) or has a trailing segment (the ``/state`` echo).
+            return None
+        return remainder
+
+    def _apply_safety_switch(self, key: str, payload: str) -> None:
+        """Toggle a per-worker safety switch and re-publish its retained state.
+
+        The gate state is authoritative in the worker; the retained state_topic is
+        only HA's reflection of it. We log the transition because arming a scope is
+        a safety-relevant event.
+        """
+        value = payload.strip().upper() == _SWITCH_ON
+        if key == _CONTROLS_ENABLED_KEY:
+            self._controls_enabled = value
+        else:  # _ALLOW_POWER_KEY (the only other member of _SAFETY_SWITCH_KEYS)
+            self._allow_power = value
+        _log.info("%s: safety switch %s -> %s", self._device_id, key,
+                  _SWITCH_ON if value else _SWITCH_OFF)
+        self._publish_control_state(key, value)
+
+    def _dispatch_control(self, key: str, payload: str) -> None:
+        """Dispatch one control through the safety gate and reflect the result.
+
+        The gate state passed here is THIS worker's, so a command for one scope can
+        never be gated by (or affect) another. On a successful dispatch of a
+        stateful control (switch/select/number/text) the accepted value is echoed
+        to its state_topic so HA shows the live setting; a momentary button is not
+        echoed. A refusal/error is already logged by the dispatcher with a reason;
+        we never fail silently.
+        """
+        result = control.dispatch(
+            self._alpaca, key, payload,
+            controls_enabled=self._controls_enabled,
+            allow_power=self._allow_power,
+        )
+        if result.status is DispatchStatus.OK and self._control_is_stateful(key):
+            self._publish_control_state(key, payload)
+
+    @staticmethod
+    def _control_is_stateful(key: str) -> bool:
+        """True iff the dispatch catalog marks ``key`` as a stateful control.
+
+        Only stateful controls (switch/select/number/text) echo their accepted
+        value back to HA; a button is momentary and has no state to reflect.
+        """
+        ctl = control.control_for(key)
+        return ctl is not None and ctl.component in _STATEFUL_DISPATCH_COMPONENTS
 
     def fetch_preview(self, fullname: str) -> bytes | None:
         """Fetch the saved stacked .jpg from the scope's HTTP server, downscaled.
