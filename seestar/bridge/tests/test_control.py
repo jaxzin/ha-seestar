@@ -156,10 +156,19 @@ def test_number_in_range_accepted():
     assert len(alpaca.calls) == 1
 
 
-def test_select_rejects_value_outside_options():
+def test_stored_input_rejects_value_outside_options():
+    # imaging_mode is a value-only stored input; its select options are enforced
+    # by validate_stored_input (the worker refuses to store an unknown mode).
+    assert control.validate_stored_input("imaging_mode", "not_a_mode") is not None
+    assert control.validate_stored_input("imaging_mode", "moon") is None
+
+
+def test_stored_input_key_is_not_dispatchable():
+    # A stored input (imaging_mode) is NOT a dispatch-catalog control: sending a
+    # command straight at its key must refuse without any Alpaca call.
     alpaca = _StubAlpaca()
     result = dispatch(
-        alpaca, "imaging_mode", "not_a_mode", controls_enabled=True, allow_power=False)
+        alpaca, "imaging_mode", "moon", controls_enabled=True, allow_power=True)
     assert result.status is DispatchStatus.REFUSED
     assert alpaca.calls == []
 
@@ -178,22 +187,52 @@ def test_alpaca_error_surfaces_as_error_status():
 # -- representative mappings ------------------------------------------------------
 
 def test_run_plan_imports_then_starts_scheduler():
-    # Run plan is a two-step action: import_schedule (with the selected plan's
-    # filepath) THEN start_scheduler.
+    # Run plan is a two-step action: import_schedule (with the named plan rooted
+    # in seestar_alp's own schedule/ directory) THEN start_scheduler.
     alpaca = _StubAlpaca()
     result = dispatch(
-        alpaca, "run_plan", "/plans/orion.json", controls_enabled=True, allow_power=False)
+        alpaca, "run_plan", "orion.json", controls_enabled=True, allow_power=False)
     assert result.status is DispatchStatus.OK
     names = [name for name, _ in alpaca.calls]
     assert names == ["import_schedule", "start_scheduler"]
     import_params = alpaca.calls[0][1]
-    assert import_params["filepath"] == "/plans/orion.json"
+    assert import_params["filepath"] == "schedule/orion.json"
 
 
-def test_start_live_view_passes_the_selected_mode():
+def test_run_plan_appends_json_suffix_to_bare_name():
     alpaca = _StubAlpaca()
     result = dispatch(
-        alpaca, "start_live_view", "moon", controls_enabled=True, allow_power=False)
+        alpaca, "run_plan", "orion", controls_enabled=True, allow_power=False)
+    assert result.status is DispatchStatus.OK
+    assert alpaca.calls[0][1]["filepath"] == "schedule/orion.json"
+
+
+@pytest.mark.parametrize("evil", [
+    "../../etc/passwd",         # relative traversal
+    "/etc/passwd",              # absolute path
+    "subdir/plan.json",         # any separator escapes the basename constraint
+    "..\\..\\secrets.json",     # windows-style separator
+    "~root/plan.json",          # home expansion
+    ".hidden.json",             # dotfile
+    "",                         # empty
+    "   ",                      # whitespace only
+])
+def test_run_plan_refuses_path_traversal_and_non_basenames(evil):
+    # seestar_alp's import_schedule does open(filepath) VERBATIM, so anything but
+    # a bare plan name must refuse BEFORE any Alpaca call.
+    alpaca = _StubAlpaca()
+    result = dispatch(
+        alpaca, "run_plan", evil, controls_enabled=True, allow_power=False)
+    assert result.status is DispatchStatus.REFUSED
+    assert result.reason
+    assert alpaca.calls == []  # CRITICAL: the traversal never reached the scope
+
+
+def test_start_live_view_uses_the_stored_mode():
+    alpaca = _StubAlpaca()
+    result = dispatch(
+        alpaca, "start_live_view", "PRESS", controls_enabled=True,
+        allow_power=False, stored={control.IMAGING_MODE_KEY: "moon"})
     assert result.status is DispatchStatus.OK
     name, params = alpaca.calls[0]
     assert name == "method_sync"
@@ -201,19 +240,112 @@ def test_start_live_view_passes_the_selected_mode():
     assert params["params"]["mode"] == "moon"
 
 
-def test_goto_passes_the_target():
+def test_start_live_view_defaults_to_star_when_mode_unset():
     alpaca = _StubAlpaca()
     result = dispatch(
-        alpaca, "goto", "M31", controls_enabled=True, allow_power=False)
+        alpaca, "start_live_view", "PRESS", controls_enabled=True,
+        allow_power=False, stored={})
+    assert result.status is DispatchStatus.OK
+    assert alpaca.calls[0][1]["params"]["mode"] == "star"
+
+
+# -- goto: real coordinates only ---------------------------------------------------
+
+def _goto_stored(target="M31", ra="0.7123", dec="41.269"):
+    return {
+        control.GOTO_TARGET_KEY: target,
+        control.GOTO_RA_KEY: ra,
+        control.GOTO_DEC_KEY: dec,
+    }
+
+
+def test_goto_with_valid_decimal_coords_issues_goto_target():
+    alpaca = _StubAlpaca()
+    result = dispatch(
+        alpaca, "goto", "PRESS", controls_enabled=True, allow_power=False,
+        stored=_goto_stored())
     assert result.status is DispatchStatus.OK
     name, params = alpaca.calls[0]
     assert name == "goto_target"
     assert params["target_name"] == "M31"
+    assert params["is_j2000"] is True
+    assert params["ra"] == pytest.approx(0.7123)
+    assert params["dec"] == pytest.approx(41.269)
 
 
-def test_park_is_power_gated_and_maps_to_shutdown_method():
-    # Park is a power action; with both switches on it dispatches the documented
-    # pi-shutdown method_sync call.
+def test_goto_parses_sexagesimal_coordinates():
+    alpaca = _StubAlpaca()
+    result = dispatch(
+        alpaca, "goto", "PRESS", controls_enabled=True, allow_power=False,
+        stored=_goto_stored(ra="0h42m44s", dec="+41d16m9s"))
+    assert result.status is DispatchStatus.OK
+    params = alpaca.calls[0][1]
+    assert params["ra"] == pytest.approx(0 + 42 / 60 + 44 / 3600)
+    assert params["dec"] == pytest.approx(41 + 16 / 60 + 9 / 3600)
+
+
+def test_goto_parses_colon_separated_negative_dec():
+    alpaca = _StubAlpaca()
+    result = dispatch(
+        alpaca, "goto", "PRESS", controls_enabled=True, allow_power=False,
+        stored=_goto_stored(ra="5:35:17", dec="-05:23:28"))
+    assert result.status is DispatchStatus.OK
+    params = alpaca.calls[0][1]
+    assert params["ra"] == pytest.approx(5 + 35 / 60 + 17 / 3600)
+    assert params["dec"] == pytest.approx(-(5 + 23 / 60 + 28 / 3600))
+
+
+def test_goto_without_coordinates_is_refused_never_fabricated():
+    # goto_target does NOT resolve names; without real coordinates the command
+    # must refuse — a fabricated ra=0/dec=0 would slew to a real (wrong) place.
+    alpaca = _StubAlpaca()
+    result = dispatch(
+        alpaca, "goto", "PRESS", controls_enabled=True, allow_power=False,
+        stored={control.GOTO_TARGET_KEY: "M31"})  # name only, no RA/Dec
+    assert result.status is DispatchStatus.REFUSED
+    assert result.reason
+    assert alpaca.calls == []  # CRITICAL: nothing reached the scope
+
+
+def test_goto_with_unparseable_coordinates_is_refused():
+    alpaca = _StubAlpaca()
+    result = dispatch(
+        alpaca, "goto", "PRESS", controls_enabled=True, allow_power=False,
+        stored=_goto_stored(ra="Andromeda", dec="up a bit"))
+    assert result.status is DispatchStatus.REFUSED
+    assert alpaca.calls == []
+
+
+@pytest.mark.parametrize("ra,dec", [
+    ("25.0", "10.0"),    # RA beyond 24h
+    ("-1.0", "10.0"),    # negative RA
+    ("10.0", "91.0"),    # Dec beyond +90
+    ("10.0", "-90.5"),   # Dec beyond -90
+    ("nan", "10.0"),     # NaN never passes the range check
+])
+def test_goto_with_out_of_range_coordinates_is_refused(ra, dec):
+    alpaca = _StubAlpaca()
+    result = dispatch(
+        alpaca, "goto", "PRESS", controls_enabled=True, allow_power=False,
+        stored=_goto_stored(ra=ra, dec=dec))
+    assert result.status is DispatchStatus.REFUSED
+    assert alpaca.calls == []
+
+
+def test_goto_without_a_name_uses_a_default_label():
+    alpaca = _StubAlpaca()
+    result = dispatch(
+        alpaca, "goto", "PRESS", controls_enabled=True, allow_power=False,
+        stored=_goto_stored(target=""))
+    assert result.status is DispatchStatus.OK
+    assert alpaca.calls[0][1]["target_name"]  # a non-empty session label
+
+
+# -- park vs shutdown ---------------------------------------------------------------
+
+def test_park_is_power_gated_and_stows_the_mount_only():
+    # Park maps to the MOUNT-STOW rpc (scope_park — the same command seestar_alp's
+    # own shut_down_thread parks with), NOT to the Pi power-off.
     park = _control("park")
     assert park.power_gated is True
     alpaca = _StubAlpaca()
@@ -222,7 +354,23 @@ def test_park_is_power_gated_and_maps_to_shutdown_method():
     assert result.status is DispatchStatus.OK
     name, params = alpaca.calls[0]
     assert name == "method_sync"
-    assert params["method"] == "pi_shutdown"
+    assert params["method"] == "scope_park"
+
+
+def test_park_and_shutdown_dispatch_different_methods():
+    # THE BLOCKER: park must never power off the Pi. The two power controls must
+    # dispatch DIFFERENT methods, and park's calls must never contain pi_shutdown.
+    park_alpaca = _StubAlpaca()
+    dispatch(park_alpaca, "park", {}, controls_enabled=True, allow_power=True)
+    shutdown_alpaca = _StubAlpaca()
+    dispatch(shutdown_alpaca, "shutdown", {}, controls_enabled=True, allow_power=True)
+
+    park_methods = [p.get("method") for _, p in park_alpaca.calls]
+    shutdown_methods = [p.get("method") for _, p in shutdown_alpaca.calls]
+    assert park_methods != shutdown_methods
+    assert "pi_shutdown" not in park_methods  # park NEVER powers off the Pi
+    assert park_methods == ["scope_park"]
+    assert shutdown_methods == ["pi_shutdown"]
 
 
 def test_dew_heater_switch_on_maps_to_heater_value():
@@ -270,6 +418,15 @@ def test_every_control_key_is_unique():
     assert len(keys) == len(set(keys))
 
 
+#: Valid stored-input snapshot for the smoke dispatch of every trigger control.
+_SAMPLE_STORED = {
+    control.IMAGING_MODE_KEY: "moon",
+    control.GOTO_TARGET_KEY: "M42",
+    control.GOTO_RA_KEY: "5.591",
+    control.GOTO_DEC_KEY: "-5.39",
+}
+
+
 def test_every_control_action_is_dispatchable_from_a_known_key():
     # Smoke: every catalog entry can be dispatched (gate open) and reaches Alpaca,
     # so no catalog entry references an action the dispatcher can't build params for.
@@ -277,7 +434,8 @@ def test_every_control_action_is_dispatchable_from_a_known_key():
         alpaca = _StubAlpaca()
         payload = _sample_payload(ctl)
         result = dispatch(
-            alpaca, ctl.key, payload, controls_enabled=True, allow_power=True)
+            alpaca, ctl.key, payload, controls_enabled=True, allow_power=True,
+            stored=_SAMPLE_STORED)
         assert result.status is DispatchStatus.OK, f"{ctl.key} did not dispatch"
         assert alpaca.calls, f"{ctl.key} reached no Alpaca action"
 
@@ -293,6 +451,32 @@ def _sample_payload(ctl):
     if ctl.component == control.COMPONENT_TEXT:
         return "M42"
     return {}  # button
+
+
+def test_stored_input_keys_do_not_collide_with_dispatch_controls():
+    dispatch_keys = {ctl.key for ctl in control.CONTROLS}
+    stored_keys = {si.key for si in control.STORED_INPUTS}
+    assert dispatch_keys.isdisjoint(stored_keys)
+
+
+def test_exposure_is_milliseconds_passed_through():
+    # action_set_exposure's ``exp`` is MILLISECONDS on the wire; the control's ms
+    # value is passed through untouched (no unit conversion to get wrong).
+    alpaca = _StubAlpaca()
+    result = dispatch(
+        alpaca, "exposure", "30000", controls_enabled=True, allow_power=False)
+    assert result.status is DispatchStatus.OK
+    name, params = alpaca.calls[0]
+    assert name == "action_set_exposure"
+    assert params["exp"] == 30000
+
+
+def test_exposure_range_spans_solar_to_deep_sky_ms():
+    # 1 ms (solar) .. 60000 ms (60 s deep-sky): the range must make the scope's
+    # real exposure domain reachable, in the SAME unit the wire uses.
+    exposure = _control("exposure")
+    assert exposure.min_value == control.EXPOSURE_MIN_MS == 1
+    assert exposure.max_value == control.EXPOSURE_MAX_MS == 60_000
 
 
 # -- discovery: command entities --------------------------------------------------
@@ -345,6 +529,43 @@ def test_number_discovery_carries_range_and_step():
     assert payload["min"] == ctl.min_value
     assert payload["max"] == ctl.max_value
     assert payload["step"] == ctl.step
+
+
+def test_exposure_discovery_unit_and_range_match_the_dispatched_ms():
+    # MAJOR: the HA number's label/range/unit must match what action_set_exposure
+    # actually receives (milliseconds, passed through).
+    ctl, payload = _control_payload("exposure")
+    assert payload["unit_of_measurement"] == "ms"
+    assert payload["min"] == control.EXPOSURE_MIN_MS
+    assert payload["max"] == control.EXPOSURE_MAX_MS
+
+
+def test_goto_entities_pair_value_texts_with_a_trigger_button():
+    # The goto surface: three stored value texts (name + REAL coordinates) and a
+    # momentary trigger button, so no fabricated coordinate can ever be sent.
+    for key in ("goto_target", "goto_ra", "goto_dec"):
+        ctl, payload = _control_payload(key)
+        assert ctl.component == "text", key
+        assert payload["state_topic"] == f"{BASE_TOPIC}/cmd/{key}/state"
+    button, payload = _control_payload("goto")
+    assert button.component == "button"
+    assert "state_topic" not in payload
+
+
+def test_imaging_mode_select_options_match_the_dispatch_modes():
+    ctl, _payload = _control_payload("imaging_mode")
+    assert ctl.component == "select"
+    stored = control.stored_input_for("imaging_mode")
+    assert stored is not None
+    assert ctl.options == stored.options
+
+
+def test_start_live_view_is_a_momentary_button():
+    # MAJOR: selecting a mode must not start a session; the session starter is a
+    # separate button (which reads the stored mode at press time).
+    ctl, payload = _control_payload("start_live_view")
+    assert ctl.component == "button"
+    assert "payload_press" in payload
 
 
 def test_select_discovery_carries_options():

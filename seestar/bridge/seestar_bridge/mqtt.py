@@ -97,9 +97,12 @@ def set_router(
       every paho reconnect, so a dropped-and-restored broker link never leaves a
       scope deaf to commands.
     - ``on_message`` decodes the payload and hands ``(topic, payload)`` to
-      ``handler``. The call is wrapped so ANY exception the handler raises is
-      logged and swallowed: a single malformed command must never crash paho's
-      network loop or the shared client that every scope depends on.
+      ``handler``. RETAINED messages are dropped first: the broker replays a
+      retained publish on every (re)subscribe, so routing one would re-fire a
+      stale command at the telescope on every reconnect. The handler call is
+      wrapped so ANY exception it raises is logged and swallowed: a single
+      malformed command must never crash paho's network loop or the shared
+      client that every scope depends on.
 
     ``command_filters`` are MQTT topic filters (e.g. ``seestar/<device>/cmd/#``),
     one per scope; the caller owns the mapping from a concrete topic back to a
@@ -119,6 +122,16 @@ def set_router(
 
     def _on_message(_client, _userdata, message):
         topic = message.topic
+        # SAFETY: a RETAINED payload on a command topic would re-fire on EVERY
+        # reconnect — a stale 'goto'/'park' replayed at the telescope each time
+        # the broker link blips. Commands are momentary by contract (the bridge
+        # itself never publishes retained to a bare cmd/<key> topic; its retained
+        # echoes go to the .../state topics, which are ignored as inbound), so
+        # any retained inbound command is a replay or a misbehaving publisher:
+        # drop it before routing.
+        if getattr(message, "retain", False):
+            _log.warning("dropping retained command replay on %s", topic)
+            return
         try:
             payload = message.payload.decode("utf-8")
         except UnicodeDecodeError:

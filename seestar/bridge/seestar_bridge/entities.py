@@ -275,17 +275,25 @@ class ControlEntity(NamedTuple):
     max_value: float | None = None
     step: float | None = None
     options: tuple[str, ...] | None = None
+    unit: str | None = None
 
 
 # Imaging modes offered by the Imaging-mode select (mirrors control._IMAGING_MODES;
 # the two are asserted disjoint-from-Phase-1 and consistent by the control tests).
 _IMAGING_MODES = ("star", "scenery", "planet", "sun", "moon")
 
+# Exposure bounds in MILLISECONDS — must mirror control.EXPOSURE_MIN/MAX_MS
+# (asserted consistent by the control tests): action_set_exposure's ``exp`` is
+# ms on the wire, so the HA number is ms end-to-end (solar ~1-5 ms up to 60 s).
+_EXPOSURE_MIN_MS = 1
+_EXPOSURE_MAX_MS = 60_000
+_EXPOSURE_UNIT = "ms"
+
 # The command catalog. Per the Phase-2 spec's "expose everything" directive, this
 # covers Session/imaging, Plans execution, and Power/position, PLUS the two
-# first-class safety switches. Param-carrying discrete actions pair a value entity
-# (select/number/text) with a trigger button that shares the action; both are
-# listed so HA renders the full surface.
+# first-class safety switches. Param-carrying discrete actions pair VALUE-ONLY
+# stored inputs (imaging_mode; the goto target/RA/Dec texts — stored + echoed by
+# the worker, never dispatched) with the trigger button that consumes them.
 CONTROL_ENTITIES: list[ControlEntity] = [
     # -- Safety switches (both default OFF; gate all/power commands) --
     ControlEntity(_COMPONENT_SWITCH, "controls_enabled", "Controls enabled",
@@ -293,10 +301,12 @@ CONTROL_ENTITIES: list[ControlEntity] = [
     ControlEntity(_COMPONENT_SWITCH, "allow_power", "Allow power actions",
                   "mdi:power-settings"),
     # -- Session / imaging --
-    ControlEntity(_COMPONENT_SELECT, "start_live_view", "Start live view",
-                  "mdi:play-box", options=_IMAGING_MODES),
+    # Imaging mode is a stored VALUE: changing it never starts a session; the
+    # 'Start live view' button reads it (default 'star') when pressed.
     ControlEntity(_COMPONENT_SELECT, "imaging_mode", "Imaging mode",
                   "mdi:camera-iris", options=_IMAGING_MODES),
+    ControlEntity(_COMPONENT_BUTTON, "start_live_view", "Start live view",
+                  "mdi:play-box"),
     ControlEntity(_COMPONENT_BUTTON, "start_stack", "Start stacking",
                   "mdi:layers-plus"),
     ControlEntity(_COMPONENT_BUTTON, "stop", "Stop", "mdi:stop"),
@@ -304,11 +314,19 @@ CONTROL_ENTITIES: list[ControlEntity] = [
                   "mdi:grid"),
     ControlEntity(_COMPONENT_BUTTON, "start_spectra", "Start spectra",
                   "mdi:chart-bell-curve"),
-    ControlEntity(_COMPONENT_TEXT, "goto", "Goto target", "mdi:crosshairs-gps"),
+    # Goto inputs are stored VALUES (name label + REAL coordinates); the 'Goto'
+    # button dispatches with them and is refused unless RA/Dec parse — seestar_alp
+    # does not resolve target names, so no coordinate is ever fabricated.
+    ControlEntity(_COMPONENT_TEXT, "goto_target", "Goto target",
+                  "mdi:format-title"),
+    ControlEntity(_COMPONENT_TEXT, "goto_ra", "Goto RA", "mdi:axis-arrow"),
+    ControlEntity(_COMPONENT_TEXT, "goto_dec", "Goto Dec", "mdi:axis-arrow"),
+    ControlEntity(_COMPONENT_BUTTON, "goto", "Goto", "mdi:crosshairs-gps"),
     ControlEntity(_COMPONENT_BUTTON, "stop_goto", "Stop goto",
                   "mdi:crosshairs-off"),
-    ControlEntity(_COMPONENT_NUMBER, "exposure", "Exposure", "mdi:camera-timer",
-                  min_value=1, max_value=600, step=1),
+    ControlEntity(_COMPONENT_NUMBER, "exposure", "Stack exposure",
+                  "mdi:camera-timer", min_value=_EXPOSURE_MIN_MS,
+                  max_value=_EXPOSURE_MAX_MS, step=1, unit=_EXPOSURE_UNIT),
     ControlEntity(_COMPONENT_NUMBER, "focus", "Focus", "mdi:focus-field",
                   min_value=-500, max_value=500, step=1),
     ControlEntity(_COMPONENT_NUMBER, "mag_declination", "Mag declination",
@@ -393,6 +411,8 @@ def control_discovery_payload(
             cfg["max"] = entity.max_value
         if entity.step is not None:
             cfg["step"] = entity.step
+        if entity.unit is not None:
+            cfg["unit_of_measurement"] = entity.unit
     if entity.component == _COMPONENT_SELECT and entity.options is not None:
         cfg["options"] = list(entity.options)
     if entity.icon:

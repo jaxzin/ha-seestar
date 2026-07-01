@@ -101,6 +101,11 @@ _CAMERA_COMPONENT = "camera"
 _CAMERA_KEY = "preview"
 _CAMERA_NAME = "Live stacked preview"
 
+#: Discovery component for the ad-hoc last-command-result sensor (published
+#: directly here, like the camera, because its state topic is not the shared
+#: per-scope state JSON that entities.discovery_payload assumes).
+_SENSOR_COMPONENT = "sensor"
+
 # --- command (control) path constants ------------------------------------------
 
 #: Sub-topic under the base topic that roots every command topic
@@ -109,6 +114,17 @@ _CAMERA_NAME = "Live stacked preview"
 #: back out of an inbound command topic.
 _CMD_SUBTOPIC = "cmd"
 _CMD_STATE_SUBTOPIC = "state"
+
+#: Sub-topic (NOT under cmd/, so it can never be parsed as an inbound command)
+#: where every dispatch outcome is published, and the entity that surfaces it.
+#: A REFUSED/ERROR dispatch must be VISIBLE to the operator, not just a bridge
+#: log line — a silently dropped command on a physical telescope is a hazard.
+_CMD_RESULT_SUBTOPIC = "command_result"
+_CMD_RESULT_KEY = "last_command_result"
+_CMD_RESULT_NAME = "Last command result"
+_CMD_RESULT_ICON = "mdi:console-line"
+#: HA truncates/rejects sensor states beyond 255 chars; clip the reason to fit.
+_CMD_RESULT_MAX_LEN = 255
 
 #: The two first-class safety switches. They are STATEFUL and per-worker (default
 #: OFF): they are never dispatched to Alpaca — instead they hold the gate state
@@ -239,6 +255,12 @@ class ScopeWorker:
         # are isolated per worker, so arming one scope never arms another.
         self._controls_enabled = False
         self._allow_power = False
+        # Value-only stored inputs (imaging mode; goto target/RA/Dec): updated by
+        # their command topics WITHOUT any Alpaca call, consumed by the trigger
+        # buttons' dispatch. Imaging mode starts at the documented default.
+        self._stored_inputs: dict[str, str] = {
+            control.IMAGING_MODE_KEY: control.DEFAULT_IMAGING_MODE,
+        }
 
     # -- identity / topics ------------------------------------------------------
 
@@ -261,6 +283,11 @@ class ScopeWorker:
     @property
     def preview_topic(self) -> str:
         return f"{self.base_topic}/{_PREVIEW_SUBTOPIC}"
+
+    @property
+    def command_result_topic(self) -> str:
+        """Where every dispatch outcome (ok/refused/error + reason) is published."""
+        return f"{self.base_topic}/{_CMD_RESULT_SUBTOPIC}"
 
     @property
     def command_topic_filter(self) -> str:
@@ -503,11 +530,33 @@ class ScopeWorker:
         }
         camera_topic = f"{prefix}/{_CAMERA_COMPONENT}/{self._device_id}/{_CAMERA_KEY}/config"
         self._mqtt.publish(camera_topic, json.dumps(camera), retain=True)
+        # Operator-visible dispatch outcome: a plain sensor fed by the per-scope
+        # command_result topic, so a REFUSED/ERROR command shows up in HA (with
+        # its reason) instead of vanishing into the bridge log.
+        result_sensor = {
+            "name": _CMD_RESULT_NAME,
+            "unique_id": f"{self._device_id}_{_CMD_RESULT_KEY}",
+            "object_id": f"{self._device_id}_{_CMD_RESULT_KEY}",
+            "state_topic": self.command_result_topic,
+            "icon": _CMD_RESULT_ICON,
+            "availability": availability_list(
+                self._bridge_availability_topic, self.availability_topic),
+            "availability_mode": _AVAILABILITY_MODE_ALL,
+            "device": block,
+        }
+        result_topic = (
+            f"{prefix}/{_SENSOR_COMPONENT}/{self._device_id}/{_CMD_RESULT_KEY}/config")
+        self._mqtt.publish(result_topic, json.dumps(result_sensor), retain=True)
         # Seed the two safety switches to a known, retained OFF so HA renders them
         # correctly on a cold start (a switch with no retained state shows as
         # unknown). This also encodes the fail-safe default: the gate is CLOSED
         # until an operator explicitly arms it.
         self._publish_safety_state()
+        # Seed the stored inputs the same way (imaging mode's default; empty goto
+        # fields) so HA never renders them as 'unknown'.
+        for stored in control.STORED_INPUTS:
+            self._publish_control_state(
+                stored.key, self._stored_inputs.get(stored.key, ""))
 
     def _publish_safety_state(self) -> None:
         """Publish both safety switches' current gate state (retained) to HA.
@@ -542,11 +591,15 @@ class ScopeWorker:
           per-worker gate state and re-publish it (retained) to the switch's
           state_topic. These are NEVER dispatched to Alpaca — they only hold the
           gate the other commands are checked against.
+        - **stored input** (imaging mode; goto target/RA/Dec): validate, store on
+          this worker, and echo to its state_topic. NEVER dispatched — changing a
+          value must not move the scope; only its trigger button consumes it.
         - **any other control**: hand it to :func:`control.dispatch` with the
           CURRENT gate state, so no command reaches the scope unless the gate
           allows it. A stateful control's new value is echoed to its state_topic
-          on success; a refusal or an Alpaca error is logged with its reason (the
-          dispatcher already logged it; the echo/notify is the operator surface).
+          on success, and EVERY outcome (ok/refused/error + reason) is published
+          to :attr:`command_result_topic` so a blocked command is visible in HA,
+          never silent.
 
         A message on a control's own ``.../state`` echo topic (which the ``#``
         subscription also matches) is ignored so our retained echoes never loop
@@ -559,6 +612,9 @@ class ScopeWorker:
             return  # a .../state echo or a malformed topic; not a command
         if key in _SAFETY_SWITCH_KEYS:
             self._apply_safety_switch(key, payload)
+            return
+        if control.stored_input_for(key) is not None:
+            self._apply_stored_input(key, payload)
             return
         self._dispatch_control(key, payload)
 
@@ -594,23 +650,54 @@ class ScopeWorker:
                   _SWITCH_ON if value else _SWITCH_OFF)
         self._publish_control_state(key, value)
 
+    def _apply_stored_input(self, key: str, payload: str) -> None:
+        """Store a value-only input and echo it (retained) to its state_topic.
+
+        NO Alpaca call happens here by design: selecting an imaging mode or
+        typing goto coordinates must never start a session or move the scope.
+        An invalid value (a mode outside the select's options) is refused —
+        logged AND surfaced on the command-result topic — and the previous
+        stored value is kept.
+        """
+        invalid = control.validate_stored_input(key, payload)
+        if invalid is not None:
+            _log.warning("%s: stored input refused: %s", self._device_id, invalid)
+            self._publish_command_result(DispatchStatus.REFUSED.value, invalid)
+            return
+        self._stored_inputs[key] = payload
+        self._publish_control_state(key, payload)
+
     def _dispatch_control(self, key: str, payload: str) -> None:
         """Dispatch one control through the safety gate and reflect the result.
 
         The gate state passed here is THIS worker's, so a command for one scope can
-        never be gated by (or affect) another. On a successful dispatch of a
-        stateful control (switch/select/number/text) the accepted value is echoed
-        to its state_topic so HA shows the live setting; a momentary button is not
-        echoed. A refusal/error is already logged by the dispatcher with a reason;
-        we never fail silently.
+        never be gated by (or affect) another — as is the stored-input snapshot the
+        trigger buttons (goto, start live view) compose their payload from. On a
+        successful dispatch of a stateful control (switch/number/text) the accepted
+        value is echoed to its state_topic so HA shows the live setting; a momentary
+        button is not echoed. EVERY outcome — ok, refused, or error, with its
+        reason — is published to :attr:`command_result_topic` so the operator sees
+        a blocked/failed command in HA; the dispatcher's log line is not the only
+        trace.
         """
         result = control.dispatch(
             self._alpaca, key, payload,
             controls_enabled=self._controls_enabled,
             allow_power=self._allow_power,
+            stored=self._stored_inputs,
         )
         if result.status is DispatchStatus.OK and self._control_is_stateful(key):
             self._publish_control_state(key, payload)
+        self._publish_command_result(result.status.value, result.reason or key)
+
+    def _publish_command_result(self, status: str, detail: str) -> None:
+        """Publish one dispatch outcome (retained) to the command-result topic.
+
+        Rendered as ``<status>: <detail>`` and clipped to HA's 255-char sensor
+        state limit. Retained so the last outcome survives an HA restart.
+        """
+        text = f"{status}: {detail}"[:_CMD_RESULT_MAX_LEN]
+        self._mqtt.publish(self.command_result_topic, text, retain=True)
 
     @staticmethod
     def _control_is_stateful(key: str) -> bool:
@@ -771,6 +858,12 @@ class ScopeWorker:
                         _SLOW_BACKOFF_MAX_SEC, state_poll * (_SLOW_BACKOFF_BASE ** slow_fail_streak))
                     _log.info("%s: get_device_state busy; backing off %ds",
                               self._device_id, int(slow_backoff_until - now))
+                except RuntimeError as exc:
+                    # An Alpaca-level error or an in-band seestar_alp refusal on
+                    # the best-effort health probe: skip this cycle's merge and
+                    # keep the loop alive (the fields simply stay stale).
+                    _log.warning("%s: get_device_state failed; skipping: %s",
+                                 self._device_id, exc)
                 self._poll_park_flags(state)
 
             # Publish liveness that reflects reality: 'online' only when the scope
@@ -793,7 +886,9 @@ class ScopeWorker:
         """
         try:
             event_state = self._alpaca.action(_EVENT_STATE_ACTION, {})
-        except _PROBE_ERRORS as exc:
+        except (RuntimeError, *_PROBE_ERRORS) as exc:
+            # RuntimeError covers an Alpaca-level error or an in-band seestar_alp
+            # refusal; either way this cycle degrades to unreachable, not a crash.
             _log.warning("%s: event poll failed: %s", self._device_id, exc)
             return {}, None, False
         state = self.build_state(event_state if isinstance(event_state, dict) else {}, unix_t=now)

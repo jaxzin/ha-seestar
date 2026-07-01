@@ -23,6 +23,8 @@ import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import pytest
+
 from seestar_bridge.entities import control_state_topic
 from seestar_bridge.main import build_workers, make_command_router, subscribe_commands
 from seestar_bridge.settings import MqttSettings, Settings
@@ -124,10 +126,14 @@ class _FakeMqtt:
     def subscribe(self, topic, qos=0):
         self.subscriptions.append(topic)
 
-    def inject(self, topic, payload):
-        """Deliver an inbound command the way paho would (bytes payload)."""
+    def inject(self, topic, payload, retain=False):
+        """Deliver an inbound command the way paho would (bytes payload).
+
+        ``retain=True`` simulates the broker replaying a RETAINED publish (as it
+        does on every re-subscribe after a reconnect).
+        """
         assert self.on_message is not None, "router not installed"
-        message = _Message(topic, payload.encode("utf-8"))
+        message = _Message(topic, payload.encode("utf-8"), retain=retain)
         self.on_message(self, None, message)
 
     def retained_state(self, topic):
@@ -137,11 +143,12 @@ class _FakeMqtt:
 
 
 class _Message:
-    """Minimal paho MQTTMessage stand-in (topic + raw bytes payload)."""
+    """Minimal paho MQTTMessage stand-in (topic + raw bytes payload + retain)."""
 
-    def __init__(self, topic, payload):
+    def __init__(self, topic, payload, retain=False):
         self.topic = topic
         self.payload = payload
+        self.retain = retain
 
 
 def _settings(alpaca_base):
@@ -215,13 +222,17 @@ def test_on_connect_resubscribes_all_filters_on_reconnect():
 
 # -- (b) armed command issues the right /action -----------------------------------
 
-def test_start_live_view_armed_issues_iscope_start_view():
+def test_start_live_view_uses_stored_imaging_mode():
+    # MAJOR: selecting the mode is value-only; the PRESS on 'Start live view'
+    # reads the stored mode and starts the session with it.
     stub = _StubAlp()
     fake_mqtt = _FakeMqtt()
     try:
         _wire(stub, fake_mqtt)
         _arm(fake_mqtt, ALPHA_ID)
-        fake_mqtt.inject(_cmd_topic(ALPHA_ID, "start_live_view"), "moon")
+        fake_mqtt.inject(_cmd_topic(ALPHA_ID, "imaging_mode"), "moon")
+        assert stub.actions_for(1) == []  # mode change alone starts NOTHING
+        fake_mqtt.inject(_cmd_topic(ALPHA_ID, "start_live_view"), "PRESS")
     finally:
         stub.shutdown()
 
@@ -233,6 +244,36 @@ def test_start_live_view_armed_issues_iscope_start_view():
     assert params["params"]["mode"] == "moon"
 
 
+def test_imaging_mode_change_calls_no_action_but_updates_state():
+    # The imaging-mode select is stateful VALUE-ONLY: changing it never touches
+    # Alpaca, but its state_topic echoes the stored value for HA.
+    stub = _StubAlp()
+    fake_mqtt = _FakeMqtt()
+    try:
+        _wire(stub, fake_mqtt)
+        _arm(fake_mqtt, ALPHA_ID)
+        fake_mqtt.inject(_cmd_topic(ALPHA_ID, "imaging_mode"), "planet")
+    finally:
+        stub.shutdown()
+    assert stub.actions_for(1) == []  # CRITICAL: no session started
+    topic = control_state_topic(f"seestar/{ALPHA_ID}", "imaging_mode")
+    assert fake_mqtt.retained_state(topic) == "planet"
+
+
+def test_start_live_view_defaults_to_star_when_mode_never_set():
+    stub = _StubAlp()
+    fake_mqtt = _FakeMqtt()
+    try:
+        _wire(stub, fake_mqtt)
+        _arm(fake_mqtt, ALPHA_ID)
+        fake_mqtt.inject(_cmd_topic(ALPHA_ID, "start_live_view"), "PRESS")
+    finally:
+        stub.shutdown()
+    calls = stub.actions_for(1)
+    assert len(calls) == 1
+    assert calls[0][1]["params"]["mode"] == "star"
+
+
 # -- (c) same command with controls disabled issues NO /action --------------------
 
 def test_start_live_view_gated_issues_no_action():
@@ -242,11 +283,72 @@ def test_start_live_view_gated_issues_no_action():
         _wire(stub, fake_mqtt)
         # Gate is OFF by default: do NOT arm. The command must be refused with no
         # /action reaching the scope at all.
-        fake_mqtt.inject(_cmd_topic(ALPHA_ID, "start_live_view"), "moon")
+        fake_mqtt.inject(_cmd_topic(ALPHA_ID, "start_live_view"), "PRESS")
     finally:
         stub.shutdown()
 
     assert stub.actions_for(1) == []  # CRITICAL: nothing reached the scope
+
+
+def test_disarming_closes_the_gate_for_subsequent_commands():
+    # MAJOR: the gate is read LIVE on every dispatch. Arm -> command fires;
+    # disarm -> the SAME command must not fire a second /action.
+    stub = _StubAlp()
+    fake_mqtt = _FakeMqtt()
+    try:
+        _wire(stub, fake_mqtt)
+        _arm(fake_mqtt, ALPHA_ID)
+        fake_mqtt.inject(_cmd_topic(ALPHA_ID, "start_stack"), "PRESS")
+        assert [name for name, _ in stub.actions_for(1)] == ["start_stack"]
+
+        fake_mqtt.inject(_cmd_topic(ALPHA_ID, "controls_enabled"), "OFF")
+        fake_mqtt.inject(_cmd_topic(ALPHA_ID, "start_stack"), "PRESS")
+    finally:
+        stub.shutdown()
+
+    # Still exactly ONE action: the post-disarm command never reached the scope.
+    assert [name for name, _ in stub.actions_for(1)] == ["start_stack"]
+
+
+# -- retained-command replay protection --------------------------------------------
+
+def test_retained_command_is_dropped_without_dispatch():
+    # BLOCKER: the broker replays retained publishes on every re-subscribe, so a
+    # retained cmd/# payload would re-fire (e.g. re-park the scope) on every
+    # reconnect. A retained inbound command must be dropped before routing.
+    stub = _StubAlp()
+    fake_mqtt = _FakeMqtt()
+    try:
+        _wire(stub, fake_mqtt)
+        _arm(fake_mqtt, ALPHA_ID)
+        fake_mqtt.inject(_cmd_topic(ALPHA_ID, "start_stack"), "PRESS", retain=True)
+    finally:
+        stub.shutdown()
+    assert stub.actions_for(1) == []  # CRITICAL: the replay never reached the scope
+
+
+def test_bridge_publishes_no_retained_message_on_any_command_topic():
+    # The counterpart guarantee: nothing the bridge itself publishes may sit
+    # retained on a bare cmd/<key> topic (state echoes go to .../state, results
+    # to .../command_result — neither parses as an inbound command key).
+    stub = _StubAlp()
+    fake_mqtt = _FakeMqtt()
+    try:
+        workers = _wire(stub, fake_mqtt)
+        _arm(fake_mqtt, ALPHA_ID, allow_power=True)
+        fake_mqtt.inject(_cmd_topic(ALPHA_ID, "imaging_mode"), "moon")
+        fake_mqtt.inject(_cmd_topic(ALPHA_ID, "exposure"), "30")
+        fake_mqtt.inject(_cmd_topic(ALPHA_ID, "start_stack"), "PRESS")
+    finally:
+        stub.shutdown()
+    command_topics = {
+        _cmd_topic(worker.device_id, key)
+        for worker in workers
+        for key in ("controls_enabled", "allow_power", "imaging_mode", "exposure",
+                    "start_stack", "goto", "park", "shutdown")
+    }
+    retained_topics = {t for t, _p, r in fake_mqtt.published if r}
+    assert retained_topics.isdisjoint(command_topics)
 
 
 # -- (d) Park needs BOTH switches -------------------------------------------------
@@ -262,7 +364,8 @@ def test_park_needs_controls_enabled_and_allow_power():
         fake_mqtt.inject(_cmd_topic(ALPHA_ID, "park"), "PRESS")
         assert stub.actions_for(1) == []  # power gate closed
 
-        # Now also allow power: park dispatches the documented shutdown method.
+        # Now also allow power: park stows the MOUNT (scope_park), and must
+        # NEVER send the Pi power-off (that is shutdown's method alone).
         fake_mqtt.inject(_cmd_topic(ALPHA_ID, "allow_power"), "ON")
         fake_mqtt.inject(_cmd_topic(ALPHA_ID, "park"), "PRESS")
     finally:
@@ -272,7 +375,100 @@ def test_park_needs_controls_enabled_and_allow_power():
     assert len(calls) == 1
     action, params = calls[0]
     assert action == "method_sync"
-    assert params["method"] == "pi_shutdown"
+    assert params["method"] == "scope_park"
+    assert all(p.get("method") != "pi_shutdown" for _, p in calls)
+
+
+# -- goto: stored coordinates end-to-end -------------------------------------------
+
+def _set_goto_inputs(fake_mqtt, device_id, *, target="M31", ra="0.7123", dec="41.269"):
+    fake_mqtt.inject(_cmd_topic(device_id, "goto_target"), target)
+    fake_mqtt.inject(_cmd_topic(device_id, "goto_ra"), ra)
+    fake_mqtt.inject(_cmd_topic(device_id, "goto_dec"), dec)
+
+
+def test_goto_with_stored_coordinates_issues_goto_target():
+    stub = _StubAlp()
+    fake_mqtt = _FakeMqtt()
+    try:
+        _wire(stub, fake_mqtt)
+        _arm(fake_mqtt, ALPHA_ID)
+        _set_goto_inputs(fake_mqtt, ALPHA_ID)
+        assert stub.actions_for(1) == []  # typing values moves NOTHING
+        fake_mqtt.inject(_cmd_topic(ALPHA_ID, "goto"), "PRESS")
+    finally:
+        stub.shutdown()
+
+    calls = stub.actions_for(1)
+    assert len(calls) == 1
+    action, params = calls[0]
+    assert action == "goto_target"
+    assert params["target_name"] == "M31"
+    assert params["ra"] == pytest.approx(0.7123)
+    assert params["dec"] == pytest.approx(41.269)
+
+
+def test_goto_without_coordinates_is_refused_and_surfaced():
+    # BLOCKER: no coordinates -> NO /action (never a fabricated ra=0/dec=0), and
+    # the refusal reason lands on the operator-visible command_result topic.
+    stub = _StubAlp()
+    fake_mqtt = _FakeMqtt()
+    try:
+        workers = _wire(stub, fake_mqtt)
+        _arm(fake_mqtt, ALPHA_ID)
+        fake_mqtt.inject(_cmd_topic(ALPHA_ID, "goto_target"), "M31")  # name only
+        fake_mqtt.inject(_cmd_topic(ALPHA_ID, "goto"), "PRESS")
+    finally:
+        stub.shutdown()
+
+    assert stub.actions_for(1) == []  # CRITICAL: nothing reached the scope
+    alpha = workers[0]
+    result = fake_mqtt.retained_state(alpha.command_result_topic)
+    assert result is not None and result.startswith("refused:")
+
+
+def test_refused_command_publishes_reason_to_result_topic():
+    # Operator feedback: a gated command must be VISIBLE in HA, not silent.
+    stub = _StubAlp()
+    fake_mqtt = _FakeMqtt()
+    try:
+        workers = _wire(stub, fake_mqtt)
+        # NOT armed: the command is refused by the gate.
+        fake_mqtt.inject(_cmd_topic(ALPHA_ID, "start_stack"), "PRESS")
+    finally:
+        stub.shutdown()
+    alpha = workers[0]
+    result = fake_mqtt.retained_state(alpha.command_result_topic)
+    assert result is not None
+    assert result.startswith("refused:")
+    assert "Controls enabled" in result  # the actionable reason, not just a code
+
+
+def test_successful_command_publishes_ok_to_result_topic():
+    stub = _StubAlp()
+    fake_mqtt = _FakeMqtt()
+    try:
+        workers = _wire(stub, fake_mqtt)
+        _arm(fake_mqtt, ALPHA_ID)
+        fake_mqtt.inject(_cmd_topic(ALPHA_ID, "start_stack"), "PRESS")
+    finally:
+        stub.shutdown()
+    result = fake_mqtt.retained_state(workers[0].command_result_topic)
+    assert result == "ok: start_stack"
+
+
+def test_command_result_sensor_discovery_is_published():
+    stub = _StubAlp()
+    fake_mqtt = _FakeMqtt()
+    try:
+        workers = _wire(stub, fake_mqtt)
+    finally:
+        stub.shutdown()
+    cfg_topic = f"homeassistant/sensor/{ALPHA_ID}/last_command_result/config"
+    payloads = [p for t, p, _ in fake_mqtt.published if t == cfg_topic]
+    assert payloads, "no discovery config for the last_command_result sensor"
+    cfg = json.loads(payloads[-1])
+    assert cfg["state_topic"] == workers[0].command_result_topic
 
 
 # -- (e) per-scope isolation: a command to A never touches B -----------------------

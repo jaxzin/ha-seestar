@@ -19,15 +19,21 @@ seestar_alp ``/action`` it invokes (the same non-blocking
 ``PUT /api/v1/telescope/{n}/action`` the bridge already uses) and a pure
 ``build`` function that maps the HA payload to the ordered list of
 ``(action_name, params)`` calls, so the wire contract is auditable in one place.
-Param-carrying discrete actions (goto, run-plan, start-live-view) pair a value
-entity with a trigger button in ``entities`` but resolve to a single ``Control``
-here that reads the value from the command payload.
+
+Param-carrying discrete actions (goto, start-live-view) split into VALUE-ONLY
+stored inputs (:data:`STORED_INPUTS` — never dispatched; the worker stores the
+value and echoes it to HA) and a trigger button whose ``payload_from_stored``
+composes the dispatch payload from those stored values at press time. A builder
+may REFUSE by raising ``ValueError`` (missing/unparseable goto coordinates, a
+path-traversal plan name); :func:`dispatch` turns that into ``REFUSED`` before
+any Alpaca call ever happens.
 """
 from __future__ import annotations
 
 import enum
 import logging
-from collections.abc import Callable, Sequence
+import re
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
@@ -48,23 +54,74 @@ _SWITCH_OFF = "OFF"
 #    method_sync dispatch rather than a dedicated /action name) ------------------
 _METHOD_SYNC = "method_sync"
 _METHOD_ISCOPE_START_VIEW = "iscope_start_view"
+#: The MOUNT-STOW command: seestar_device sends ``{"method": "scope_park"}`` to
+#: stow the arm (its shut_down_thread parks with exactly this before powering
+#: off). Park uses THIS and only this.
+_METHOD_SCOPE_PARK = "scope_park"
+#: Powers off the WHOLE device (seestar_device.shut_down_thread: park, then
+#: shut down the Pi). Only the ``shutdown`` control may ever send this.
 _METHOD_PI_SHUTDOWN = "pi_shutdown"
 
 # -- imaging modes fed to iscope_start_view (spec's Imaging mode select) ---------
 _IMAGING_MODES = ("star", "scenery", "planet", "sun", "moon")
+
+#: Mode used by 'Start live view' when the operator never touched the
+#: Imaging-mode select (matches seestar_alp's own goto_target default).
+DEFAULT_IMAGING_MODE = "star"
 
 # -- dew-heater power level when the switch is ON. The scope takes a 0..100 value;
 #    a non-zero value turns the heater on (action_set_dew_heater keys on > 0). ---
 _DEW_HEATER_ON_VALUE = 90
 _DEW_HEATER_OFF_VALUE = 0
 
-# -- goto default: a named target with is_j2000 catalog coordinates. goto_target
-#    resolves the name via the scope's own catalog, so ra/dec are placeholders. --
-_GOTO_PLACEHOLDER_RADEC = 0.0
+# -- stored-input keys: value-only entities the worker stores (never dispatched);
+#    trigger buttons compose their dispatch payload from these at press time. ----
+IMAGING_MODE_KEY = "imaging_mode"
+GOTO_TARGET_KEY = "goto_target"
+GOTO_RA_KEY = "goto_ra"
+GOTO_DEC_KEY = "goto_dec"
+
+#: Label sent to goto_target when the operator set coordinates but no name.
+_GOTO_DEFAULT_NAME = "HA goto"
+
+#: RA is decimal HOURS (0 <= ra < 24) and Dec decimal DEGREES (-90..90), matching
+#: seestar_alp's Util.parse_coordinate float branch (ra*u.hour, dec*u.deg).
+_RA_HOURS_MAX = 24.0
+_DEC_DEG_LIMIT = 90.0
+
+#: Sexagesimal coordinate: "16h41m41s", "16:41:41", "+41d16m9s", "-05:23:28".
+#: Degrees/hours then minutes then optional seconds; unit letters or colons.
+_SEXAGESIMAL_RE = re.compile(
+    r"""^(?P<sign>[+-])?
+        (?P<whole>\d{1,3})\s*[hd°:]\s*
+        (?P<minutes>\d{1,2}(?:\.\d+)?)\s*(?:[m′':]\s*
+        (?P<seconds>\d{1,2}(?:\.\d+)?)\s*[s″"]?)?[m′']?
+        $""",
+    re.VERBOSE | re.IGNORECASE,
+)
+_MINUTES_PER_UNIT = 60.0
+_SECONDS_PER_UNIT = 3600.0
 
 # -- import_schedule flags: start a fresh run of the imported plan (don't retain
 #    the previous scheduler state). --------------------------------------------
 _IMPORT_RETAIN_STATE = False
+
+#: The directory (relative to seestar_alp's working directory) where its SSC web
+#: UI saves/exports schedules — verified in seestar_alp front/app.py, which does
+#: ``os.path.join(os.getcwd(), "schedule")`` for both import and export. Run-plan
+#: names are constrained to bare basenames inside this directory because
+#: seestar_device.import_schedule does ``open(filepath)`` VERBATIM: an
+#: unconstrained value would read any file the driver can.
+_PLANS_DIR = "schedule"
+_PLAN_SUFFIX = ".json"
+_PARENT_DIR = ".."
+
+# -- exposure: action_set_exposure's ``exp`` is MILLISECONDS on the wire
+#    (seestar_device: set_setting {"exp_ms": {"stack_l": exp}}). The control is
+#    therefore ms end-to-end: solar work needs ~1-5 ms, deep-sky stacking tens of
+#    seconds, so the range spans 1 ms .. 60 s with the value passed through. -----
+EXPOSURE_MIN_MS = 1
+EXPOSURE_MAX_MS = 60_000
 
 # A single dispatched action as it goes on the wire: the /action name plus the
 # Parameters dict the bridge JSON-encodes. A control may emit more than one (e.g.
@@ -72,9 +129,15 @@ _IMPORT_RETAIN_STATE = False
 Call = tuple[str, dict[str, Any]]
 
 #: A control's payload->calls builder. Receives the already-validated payload
-#: (a str/number for value entities, or an empty dict for a bare button) and
-#: returns the ordered calls to make. Pure: no I/O, no gate logic.
+#: (a str/number for value entities, an empty dict for a bare button, or the
+#: dict/str composed by ``payload_from_stored``) and returns the ordered calls
+#: to make. Pure: no I/O, no gate logic. May raise ``ValueError`` to REFUSE
+#: (turned into a REFUSED result by :func:`dispatch`, never an Alpaca call).
 CallBuilder = Callable[[Any], Sequence[Call]]
+
+#: Composes a trigger control's dispatch payload from the worker's stored-input
+#: values (e.g. the Goto button reads the stored target/RA/Dec). Pure.
+StoredComposer = Callable[[Mapping[str, str]], Any]
 
 
 class Control(NamedTuple):
@@ -84,7 +147,10 @@ class Control(NamedTuple):
     that additionally require ``allow_power``. ``build`` turns a validated payload
     into the ordered ``(action, params)`` calls. Number controls carry
     ``min_value``/``max_value``/``step``; selects carry ``options`` — both are
-    range-checked by :func:`dispatch` before ``build`` ever runs.
+    range-checked by :func:`dispatch` before ``build`` ever runs. When
+    ``payload_from_stored`` is set, :func:`dispatch` IGNORES the inbound payload
+    (a button's ``PRESS``) and composes the real payload from the worker's
+    stored-input values instead.
     """
 
     key: str
@@ -96,6 +162,53 @@ class Control(NamedTuple):
     max_value: float | None = None
     step: float | None = None
     options: tuple[str, ...] | None = None
+    payload_from_stored: StoredComposer | None = None
+
+
+class StoredInput(NamedTuple):
+    """One value-only input: stored on the worker, echoed to HA, NEVER dispatched.
+
+    A stored input holds a parameter a later trigger button reads (the imaging
+    mode for 'Start live view'; the target name/RA/Dec for 'Goto'). Changing one
+    must not touch the scope — the worker validates it against ``options`` (when
+    set), stores it, and echoes it to the entity's state_topic; only the trigger
+    button's dispatch consumes it.
+    """
+
+    key: str
+    component: str
+    options: tuple[str, ...] | None = None
+
+
+STORED_INPUTS: list[StoredInput] = [
+    StoredInput(IMAGING_MODE_KEY, COMPONENT_SELECT, _IMAGING_MODES),
+    StoredInput(GOTO_TARGET_KEY, COMPONENT_TEXT),
+    StoredInput(GOTO_RA_KEY, COMPONENT_TEXT),
+    StoredInput(GOTO_DEC_KEY, COMPONENT_TEXT),
+]
+
+_STORED_INPUTS_BY_KEY: dict[str, StoredInput] = {si.key: si for si in STORED_INPUTS}
+
+
+def stored_input_for(key: str) -> StoredInput | None:
+    """Look up a value-only stored input by key, or ``None`` if not one."""
+    return _STORED_INPUTS_BY_KEY.get(key)
+
+
+def validate_stored_input(key: str, payload: Any) -> str | None:
+    """Return a refusal reason if ``payload`` is invalid for stored input ``key``.
+
+    A select-backed stored input (imaging_mode) must be one of its options; a
+    free-text one (goto target/RA/Dec) accepts any string — the goto builder
+    parses and range-checks it at dispatch time, where a bad value REFUSES the
+    slew rather than being stored wrong silently.
+    """
+    stored = _STORED_INPUTS_BY_KEY.get(key)
+    if stored is None:
+        return f"unknown stored input {key!r}"
+    if stored.options is not None and str(payload) not in stored.options:
+        return f"{key}: {payload!r} not in options {list(stored.options)}"
+    return None
 
 
 class DispatchStatus(enum.Enum):
@@ -141,25 +254,89 @@ def _simple(action_name: str, params: dict[str, Any] | None = None) -> CallBuild
 
 
 def _start_live_view(payload: Any) -> Sequence[Call]:
-    """Start the live view in the selected imaging mode (owns the session)."""
+    """Start the live view in the stored imaging mode (owns the session).
+
+    The payload is composed from the stored ``imaging_mode`` (default
+    :data:`DEFAULT_IMAGING_MODE`); re-checked here as defense in depth even
+    though the worker only stores validated modes.
+    """
+    mode = str(payload)
+    if mode not in _IMAGING_MODES:
+        raise ValueError(f"imaging mode {mode!r} not in {list(_IMAGING_MODES)}")
     return [(_METHOD_SYNC, {"method": _METHOD_ISCOPE_START_VIEW,
-                            "params": {"mode": str(payload)}})]
+                            "params": {"mode": mode}})]
+
+
+def _parse_angle(raw: Any, *, label: str) -> float:
+    """Parse a decimal or sexagesimal coordinate string to a float, or refuse.
+
+    Accepts ``"10.6847"`` (decimal), ``"0h42m44s"`` / ``"0:42:44"`` (RA), and
+    ``"+41d16m9s"`` / ``"-05:23:28"`` (Dec). Raises ``ValueError`` with an
+    operator-readable reason when missing or unparseable — NEVER substitutes a
+    default: a fabricated coordinate would slew the scope somewhere real.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError(f"{label} is not set")
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    match = _SEXAGESIMAL_RE.match(text)
+    if match is None:
+        raise ValueError(
+            f"{label} {text!r} is neither decimal nor sexagesimal (e.g. 0h42m44s)")
+    value = (float(match.group("whole"))
+             + float(match.group("minutes")) / _MINUTES_PER_UNIT
+             + float(match.group("seconds") or 0.0) / _SECONDS_PER_UNIT)
+    return -value if match.group("sign") == "-" else value
 
 
 def _goto(payload: Any) -> Sequence[Call]:
-    """Slew to a named target; goto_target resolves the name to coordinates."""
+    """Slew to REAL coordinates composed from the stored goto inputs.
+
+    seestar_alp's ``goto_target`` does NOT resolve names — it feeds ``ra``/``dec``
+    straight into Util.parse_coordinate (float => J2000 hours/degrees), so this
+    builder REFUSES (ValueError, no Alpaca call) unless the operator provided
+    parseable, in-range coordinates. ``target_name`` is only the session label.
+    """
+    stored = payload if isinstance(payload, dict) else {}
+    ra = _parse_angle(stored.get("ra"), label="goto RA")
+    dec = _parse_angle(stored.get("dec"), label="goto Dec")
+    if not 0.0 <= ra < _RA_HOURS_MAX:
+        raise ValueError(f"goto RA {ra} outside 0..{_RA_HOURS_MAX} hours")
+    if not -_DEC_DEG_LIMIT <= dec <= _DEC_DEG_LIMIT:
+        raise ValueError(f"goto Dec {dec} outside ±{_DEC_DEG_LIMIT} degrees")
+    target_name = str(stored.get("target_name") or "").strip() or _GOTO_DEFAULT_NAME
     return [("goto_target", {
-        "target_name": str(payload),
+        "target_name": target_name,
         "is_j2000": True,
-        "ra": _GOTO_PLACEHOLDER_RADEC,
-        "dec": _GOTO_PLACEHOLDER_RADEC,
+        "ra": ra,
+        "dec": dec,
     })]
 
 
 def _run_plan(payload: Any) -> Sequence[Call]:
-    """Run a saved plan: import it from its filepath, then start the scheduler."""
+    """Run a saved plan by NAME: import it from the plans dir, then start.
+
+    seestar_alp's ``import_schedule`` does ``open(filepath)`` verbatim, so the
+    name is strictly constrained to a bare basename (no path separators, no
+    ``..``, not absolute) inside its ``schedule/`` directory — the same place its
+    own SSC web UI saves plans. A ``.json`` suffix is appended when omitted.
+    Anything else REFUSES (ValueError) before any Alpaca call.
+    """
+    name = str(payload or "").strip()
+    if not name:
+        raise ValueError("run_plan: no plan name given")
+    if ("/" in name or "\\" in name or _PARENT_DIR in name
+            or name.startswith(("~", "."))):
+        raise ValueError(
+            f"run_plan: {name!r} is not a plan name (bare filename in the scope's "
+            f"{_PLANS_DIR}/ directory; no paths)")
+    if not name.endswith(_PLAN_SUFFIX):
+        name += _PLAN_SUFFIX
     return [
-        ("import_schedule", {"filepath": str(payload),
+        ("import_schedule", {"filepath": f"{_PLANS_DIR}/{name}",
                              "is_retain_state": _IMPORT_RETAIN_STATE}),
         ("start_scheduler", {}),
     ]
@@ -194,7 +371,19 @@ def _plate_solve_loop(payload: Any) -> Sequence[Call]:
 
 
 def _park(_payload: Any) -> Sequence[Call]:
-    """Stow/shut down the scope (power-gated) via the documented pi_shutdown."""
+    """Stow the MOUNT ONLY via scope_park (power-gated); never powers off.
+
+    Verified against seestar_alp: ``scope_park`` is the raw mount-stow RPC its
+    own shut_down_thread issues before a power-off; the ASCOM ``PUT .../park``
+    endpoint is a no-op stub, so method_sync is the working transport for it.
+    Park MUST NOT share a builder with shutdown — ``pi_shutdown`` powers off the
+    entire device (park + Pi halt).
+    """
+    return [(_METHOD_SYNC, {"method": _METHOD_SCOPE_PARK})]
+
+
+def _shutdown(_payload: Any) -> Sequence[Call]:
+    """Power off the WHOLE device (power-gated): seestar_alp parks, then halts."""
     return [(_METHOD_SYNC, {"method": _METHOD_PI_SHUTDOWN})]
 
 
@@ -216,15 +405,28 @@ def _as_number(payload: Any) -> float | int:
 # -- the catalog -----------------------------------------------------------------
 #
 # Full 'Control entity catalog' from the Phase-2 spec (Session/imaging, Plans
-# execution, Power/position). Param-carrying discrete actions use a value entity
-# (select/number/text) whose payload the builder reads; the paired trigger button
-# in entities.CONTROL_ENTITIES publishes to the SAME command key.
+# execution, Power/position). Param-carrying discrete actions pair value-only
+# STORED_INPUTS (imaging_mode, goto_target/goto_ra/goto_dec — stored + echoed by
+# the worker, never dispatched) with a trigger button here whose
+# ``payload_from_stored`` composes the real payload at press time.
+#
+# KNOWN ROUGH EDGES (verified against seestar_alp device/telescope.py +
+# device/seestar_device.py):
+# - 'Stop' maps to stop_scheduler, so it only stops a SCHEDULER-driven session;
+#   a live view / stack started outside the scheduler is not stopped by it.
+# - 'Plate-solve loop' ON is a firmware > 2.47 no-op: seestar_alp answers
+#   start_plate_solve_loop with a "Deprecated" warning and does nothing (OFF
+#   still calls stop_plate_solve_loop).
+# - seestar_alp reports many refusals IN-BAND: HTTP 200 with a json_result body
+#   of ``{"code": -1, "result": "..."}`` (e.g. import_schedule while a scheduler
+#   is active, action_start_up_sequence while busy). Alpaca.action detects that
+#   shape and raises, so these surface as ERROR dispatch results, not silent OKs.
 CONTROLS: list[Control] = [
     # -- Session / imaging --
-    Control("start_live_view", COMPONENT_SELECT, "Start live view",
-            _start_live_view, options=_IMAGING_MODES),
-    Control("imaging_mode", COMPONENT_SELECT, "Imaging mode",
-            _start_live_view, options=_IMAGING_MODES),
+    Control("start_live_view", COMPONENT_BUTTON, "Start live view",
+            _start_live_view,
+            payload_from_stored=lambda stored: stored.get(
+                IMAGING_MODE_KEY, DEFAULT_IMAGING_MODE)),
     Control("start_stack", COMPONENT_BUTTON, "Start stacking",
             _simple("start_stack", {"restart": True})),
     Control("stop", COMPONENT_BUTTON, "Stop", _simple("stop_scheduler", {})),
@@ -232,11 +434,20 @@ CONTROLS: list[Control] = [
             _simple("start_mosaic", {})),
     Control("start_spectra", COMPONENT_BUTTON, "Start spectra",
             _simple("start_spectra", {})),
-    Control("goto", COMPONENT_TEXT, "Goto target", _goto),
+    # Goto is a TRIGGER: it dispatches with the stored target name + RA/Dec text
+    # inputs and REFUSES unless the coordinates parse (goto_target does not
+    # resolve names, so fabricating ra/dec would slew to a wrong, real place).
+    Control("goto", COMPONENT_BUTTON, "Goto", _goto,
+            payload_from_stored=lambda stored: {
+                "target_name": stored.get(GOTO_TARGET_KEY),
+                "ra": stored.get(GOTO_RA_KEY),
+                "dec": stored.get(GOTO_DEC_KEY),
+            }),
     Control("stop_goto", COMPONENT_BUTTON, "Stop goto",
             _simple("stop_goto_target", {})),
-    Control("exposure", COMPONENT_NUMBER, "Exposure", _exposure,
-            min_value=1, max_value=600, step=1),
+    # Exposure is MILLISECONDS end-to-end (action_set_exposure's ``exp`` is ms).
+    Control("exposure", COMPONENT_NUMBER, "Stack exposure", _exposure,
+            min_value=EXPOSURE_MIN_MS, max_value=EXPOSURE_MAX_MS, step=1),
     Control("focus", COMPONENT_NUMBER, "Focus", _focus,
             min_value=-500, max_value=500, step=1),
     Control("mag_declination", COMPONENT_NUMBER, "Mag declination",
@@ -259,8 +470,10 @@ CONTROLS: list[Control] = [
     # -- Power / position (behind allow_power) --
     Control("startup", COMPONENT_BUTTON, "Startup sequence",
             _simple("action_start_up_sequence", {}), power_gated=True),
+    # Park stows the MOUNT ONLY (scope_park); Shutdown powers off the WHOLE
+    # device (pi_shutdown). They deliberately have DIFFERENT builders.
     Control("park", COMPONENT_BUTTON, "Park", _park, power_gated=True),
-    Control("shutdown", COMPONENT_BUTTON, "Shutdown", _park, power_gated=True),
+    Control("shutdown", COMPONENT_BUTTON, "Shutdown", _shutdown, power_gated=True),
 ]
 
 _CONTROLS_BY_KEY: dict[str, Control] = {ctl.key: ctl for ctl in CONTROLS}
@@ -312,8 +525,13 @@ def dispatch(
     *,
     controls_enabled: bool,
     allow_power: bool,
+    stored: Mapping[str, str] | None = None,
 ) -> DispatchResult:
     """Safety-gate, validate, and execute one control command.
+
+    ``stored`` is the worker's read-only stored-input snapshot (imaging mode,
+    goto target/RA/Dec); a control with ``payload_from_stored`` composes its
+    real payload from it, ignoring the inbound trigger payload.
 
     The order is deliberate and load-bearing:
 
@@ -321,7 +539,8 @@ def dispatch(
        WITHOUT touching ``alpaca``. If the control is power-gated and
        ``allow_power`` is off, refuse WITHOUT touching ``alpaca``.
     2. **Validate.** Unknown ``control_key`` and out-of-range/invalid payloads
-       are refused, again without any Alpaca call.
+       are refused, again without any Alpaca call — including a builder raising
+       ``ValueError`` (missing goto coordinates, a traversal plan name).
     3. **Execute.** Only then are the control's ``(action, params)`` calls made
        via ``alpaca.action`` (the ``PUT /action`` transport), in order. An Alpaca
        exception becomes an ``ERROR`` result (logged), never a raised exception.
@@ -341,21 +560,30 @@ def dispatch(
         return _refuse(
             f"{control_key}: power actions are disabled (arm 'Allow power actions')")
 
+    if control.payload_from_stored is not None:
+        payload = control.payload_from_stored(stored or {})
+
     invalid = _validate_payload(control, payload)
     if invalid is not None:
         return _refuse(invalid)
 
-    return _execute(alpaca, control, payload)
+    # Build BEFORE any Alpaca contact: a builder ValueError is a refusal (bad or
+    # missing inputs), and by construction nothing has reached the scope yet.
+    try:
+        calls = control.build(payload)
+    except ValueError as exc:
+        return _refuse(f"{control.key}: {exc}")
+
+    return _execute(alpaca, control, calls)
 
 
-def _execute(alpaca: Any, control: Control, payload: Any) -> DispatchResult:
+def _execute(alpaca: Any, control: Control, calls: Sequence[Call]) -> DispatchResult:
     """Run the control's ordered calls; turn any Alpaca failure into ERROR.
 
     Kept separate from the gate so the gate path is trivially auditable: this is
     the ONLY place ``alpaca.action`` is invoked, and it is unreachable until the
-    gate and validation have both passed.
+    gate, validation, and the builder have all passed.
     """
-    calls = control.build(payload)
     try:
         for action_name, params in calls:
             alpaca.action(action_name, params)
