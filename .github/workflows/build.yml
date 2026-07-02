@@ -1,0 +1,74 @@
+# Build + publish the add-on image to GHCR, and lint/test the bridge.
+#
+# The build runs once per architecture on a NATIVE runner (GitHub's free arm64
+# runners for public repos) — no qemu emulation. home-assistant/builder reads
+# the add-on version from seestar/config.yaml and the per-arch BUILD_FROM from
+# seestar/build.yaml; --docker-hub + --image compose the image name
+# ghcr.io/jaxzin/ha-seestar-{arch}, matching config.yaml's `image` key.
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "seestar/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint + test bridge
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Ruff (pinned to the version seestar_alp ships)
+        run: uvx ruff@0.12.5 check seestar/bridge
+
+      - name: Bridge test suite
+        working-directory: seestar/bridge
+        run: >-
+          uv run --python 3.12 --no-project
+          --with pytest --with paho-mqtt --with Pillow
+          python -m pytest -q
+
+  build:
+    name: Build ${{ matrix.arch }} add-on image
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build ${{ matrix.arch }} image
+        uses: home-assistant/builder@2026.06.0
+        with:
+          args: |
+            --${{ matrix.arch }} \
+            --target /data/seestar \
+            --image "ha-seestar-{arch}" \
+            --docker-hub "ghcr.io/jaxzin" \
+            --addon
