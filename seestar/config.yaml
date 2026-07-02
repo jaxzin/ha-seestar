@@ -7,7 +7,7 @@
 # image from GHCR ({arch} is substituted per architecture).
 name: Seestar for Home Assistant
 slug: seestar
-version: "1.0.0"
+version: "1.0.1"
 description: >-
   Live Seestar imaging telemetry + a stacked-image preview in Home Assistant via
   MQTT discovery. Bundles the seestar_alp driver, or reuses your own.
@@ -31,6 +31,9 @@ ports:
 ports_description:
   "7556/tcp": seestar_alp imaging API (bundled mode)
 
+# bashio reads the add-on config + the mqtt service via the Supervisor API.
+hassio_api: true
+
 # Resolve the broker from the Supervisor MQTT service when mqtt_host is blank.
 services:
   - mqtt:want
@@ -44,7 +47,7 @@ options:
   alpaca_webui_port: 5432
   imaging_port: 7556
   mqtt_host: ""
-  mqtt_port: 0
+  mqtt_port: 1883
   mqtt_username: ""
   mqtt_password: ""
   mqtt_ssl: false

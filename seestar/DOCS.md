@@ -70,7 +70,7 @@ Setting **both** `scopes` and `alpaca_host` is rejected at startup; so is settin
 | `alpaca_webui_port` | port | `5432` | **External mode only.** The port your seestar_alp serves its config on, used to look up each scope's address for the preview. |
 | `imaging_port` | port | `7556` | Port of seestar_alp's imaging server on the Alpaca host, where the Live view camera grabs its `/vid` MJPEG frames. Change only for an external seestar_alp bound to a non-stock imaging port. |
 | `mqtt_host` | string | `""` | Blank = use the Mosquitto add-on via the Supervisor. Set to override with another broker. |
-| `mqtt_port` | port | `0` | `0` = take the port from the Supervisor service. Set explicitly (e.g. `1883`, or `8883` for TLS) when overriding `mqtt_host`. |
+| `mqtt_port` | port | `1883` | Ignored while `mqtt_host` is blank (the Supervisor service supplies the port). Set `8883` for a TLS broker when overriding `mqtt_host`. |
 | `mqtt_username` | string | `""` | Broker username. Leave blank with the Mosquitto add-on. |
 | `mqtt_password` | password | `""` | Broker password. Leave blank with the Mosquitto add-on. |
 | `mqtt_ssl` | bool | `false` | Connect to the broker over TLS. Relevant only when overriding `mqtt_host`. |
