@@ -15,6 +15,7 @@ import threading
 import warnings
 import zlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from types import SimpleNamespace
 
 import pytest
 
@@ -310,8 +311,12 @@ def _cycle_settings():
     )
 
 
-def _run_one_cycle(alpaca, mqtt_client, monkeypatch, *, scope_http_base=None):
-    """Drive ScopeWorker.run() through exactly one cycle, then stop."""
+def _run_cycles(alpaca, mqtt_client, monkeypatch, *, cycles, scope_http_base=None):
+    """Drive ScopeWorker.run() through exactly ``cycles`` poll cycles, then stop.
+
+    The stop is raised from the inter-cycle ``time.sleep`` — OUTSIDE the run
+    loop's unkillable-cycle catch-all — so it still terminates the loop.
+    """
     worker = ScopeWorker(
         alpaca=alpaca,
         device=DEVICE,
@@ -320,14 +325,23 @@ def _run_one_cycle(alpaca, mqtt_client, monkeypatch, *, scope_http_base=None):
         scope_http_base=scope_http_base,
         bridge_availability_topic="seestar/bridge/availability",
     )
+    remaining = {"cycles": cycles}
 
     def _stop(_seconds):
-        raise _StopAfterOneCycle
+        remaining["cycles"] -= 1
+        if remaining["cycles"] <= 0:
+            raise _StopAfterOneCycle
 
     monkeypatch.setattr("seestar_bridge.scope.time.sleep", _stop)
     with pytest.raises(_StopAfterOneCycle):
         worker.run()
     return worker
+
+
+def _run_one_cycle(alpaca, mqtt_client, monkeypatch, *, scope_http_base=None):
+    """Drive ScopeWorker.run() through exactly one cycle, then stop."""
+    return _run_cycles(alpaca, mqtt_client, monkeypatch, cycles=1,
+                       scope_http_base=scope_http_base)
 
 
 def test_connected_is_populated_each_cycle(monkeypatch):
@@ -403,6 +417,209 @@ def test_empty_slug_device_id_falls_back_to_scope_num():
     )
     assert worker.device_id == "scope_7"
     assert worker.state_topic == "seestar/scope_7/state"
+
+
+# --- last-known state cache (driver/add-on restart resilience) ------------------
+#
+# A seestar_alp restart mid-observation wipes the driver's event cache (the
+# scope only re-sends e.g. the View target on the next goto), and an add-on
+# restart starts the worker with an empty in-memory snapshot. Both must NOT
+# blank the dashboard: the worker merges set-when-present into a persistent
+# snapshot and seeds that snapshot once from its OWN retained state topic.
+
+
+class _ScriptedAlpaca:
+    """Alpaca stand-in whose event poll (and connectivity) is scripted per cycle.
+
+    ``event_states`` supplies one value per ``get_event_state`` call (the last
+    value repeats once the script runs out); an Exception instance raises (an
+    unreachable cycle). ``connected`` may be a single value or a per-cycle
+    list, likewise repeating its last entry. ``site`` (deg) backs the
+    sitelatitude/sitelongitude probes so Alt/Az flows through the real
+    GPS-acquisition path; park/home probes stay falsy.
+    """
+
+    def __init__(self, *, event_states, connected, site=0):
+        self._event_states = list(event_states)
+        self._connected = list(connected) if isinstance(connected, (list, tuple)) else [connected]
+        self._site = site
+
+    @staticmethod
+    def _next(script):
+        return script.pop(0) if len(script) > 1 else script[0]
+
+    def action(self, name, params=None):
+        if name == "get_event_state":
+            value = self._next(self._event_states)
+            if isinstance(value, Exception):
+                raise value
+            return value
+        return {}  # method_sync (get_device_state): inert
+
+    def is_connected(self, timeout=None):
+        return self._next(self._connected)
+
+    def get(self, prop, timeout=None):
+        if prop in ("sitelatitude", "sitelongitude"):
+            return self._site
+        return 0  # park/home falsy
+
+
+class _SeedableFakeMqtt(_FakeMqtt):
+    """_FakeMqtt + paho's one-shot subscribe API, with a scripted retained payload.
+
+    ``retained`` (bytes or None) is replayed to the registered per-topic
+    callback as a retained message the moment the topic is subscribed —
+    exactly the broker's retained-delivery contract — so the worker's startup
+    seed can be exercised without a broker.
+    """
+
+    def __init__(self, retained=None):
+        super().__init__()
+        self.retained = retained
+        self.subscribed = []
+        self.unsubscribed = []
+        self.callbacks = {}
+
+    def message_callback_add(self, sub, callback):
+        self.callbacks[sub] = callback
+
+    def message_callback_remove(self, sub):
+        self.callbacks.pop(sub, None)
+
+    def subscribe(self, topic, qos=0):
+        self.subscribed.append(topic)
+        callback = self.callbacks.get(topic)
+        if callback is not None and self.retained is not None:
+            message = SimpleNamespace(topic=topic, payload=self.retained, retain=True)
+            callback(None, None, message)
+
+    def unsubscribe(self, topic):
+        self.unsubscribed.append(topic)
+
+
+def _state_payloads(mqtt_client, worker):
+    """Every JSON payload published to the worker's state topic, in order."""
+    return [json.loads(p) for t, p, _ in mqtt_client.published if t == worker.state_topic]
+
+
+def test_driver_restart_keeps_last_known_state(monkeypatch):
+    # Simulate a seestar_alp restart mid-observation: a full event snapshot,
+    # then the freshly-restarted driver's EMPTY event cache. The published
+    # JSON must still carry the last-known target/frames/pointing — the sparse
+    # snapshot must not overwrite the retained full state.
+    mqtt_client = _FakeMqtt()
+    alpaca = _ScriptedAlpaca(event_states=[EVENT_STATE, {}], connected=True, site=41.414)
+    worker = _run_cycles(alpaca, mqtt_client, monkeypatch, cycles=2)
+    states = _state_payloads(mqtt_client, worker)
+    assert len(states) == 2
+    full, after_restart = states
+    for key in ("telephoto_target", "stacked_frames", "ra", "dec",
+                "altitude", "azimuth", "stack_state"):
+        assert after_restart[key] == full[key], key
+    assert after_restart["telephoto_target"] == "NGC 7000"
+    assert after_restart["stacked_frames"] == 42
+
+
+def test_unreachable_scope_goes_offline_but_retains_last_known_state(monkeypatch):
+    # Availability still gates display: when the scope stops answering, the
+    # per-scope availability topic flips 'offline' (HA marks the entities
+    # unavailable) while the RETAINED state JSON keeps the last-known values
+    # for when the scope returns.
+    mqtt_client = _FakeMqtt()
+    alpaca = _ScriptedAlpaca(
+        event_states=[EVENT_STATE, OSError("scope gone")], connected=[True, False])
+    worker = _run_cycles(alpaca, mqtt_client, monkeypatch, cycles=2)
+    avail = [p for t, p, _ in mqtt_client.published if t == worker.availability_topic]
+    assert avail == ["online", "offline"]
+    _, last_payload, last_retain = [
+        entry for entry in mqtt_client.published if entry[0] == worker.state_topic][-1]
+    assert last_retain is True
+    last_state = json.loads(last_payload)
+    assert last_state["telephoto_target"] == "NGC 7000"
+    assert last_state["stacked_frames"] == 42
+
+
+def test_connected_stays_cycle_fresh_while_telemetry_persists(monkeypatch):
+    # `connected` is the freshness-computed key: it must reflect THIS cycle's
+    # reality even while every other key keeps its last-known value.
+    mqtt_client = _FakeMqtt()
+    alpaca = _ScriptedAlpaca(
+        event_states=[EVENT_STATE, OSError("scope gone")], connected=[True, False])
+    worker = _run_cycles(alpaca, mqtt_client, monkeypatch, cycles=2)
+    states = _state_payloads(mqtt_client, worker)
+    assert states[0]["connected"] is True
+    assert states[-1]["connected"] is False
+    assert states[-1]["telephoto_target"] == "NGC 7000"
+
+
+def test_never_observed_keys_stay_absent(monkeypatch):
+    # A key never observed is never fabricated: it stays absent from the JSON
+    # so HA renders 'unknown' — the honest "I don't know".
+    mqtt_client = _FakeMqtt()
+    sparse = {"PiStatus": {"temp": 40.0}}
+    worker = _run_cycles(
+        _ScriptedAlpaca(event_states=[sparse], connected=True),
+        mqtt_client, monkeypatch, cycles=2)
+    last = _state_payloads(mqtt_client, worker)[-1]
+    assert last["temperature"] == 40.0
+    assert "telephoto_target" not in last
+    assert "stacked_frames" not in last
+    assert "ra" not in last
+
+
+def test_seed_from_retained_state_survives_addon_restart(monkeypatch):
+    # An ADD-ON restart must not blank values either: the worker reads its own
+    # retained state topic once at startup and starts from that snapshot. Only
+    # catalog keys are seeded (defense against an old schema's leftovers), and
+    # the freshness-computed `connected` is never seeded.
+    retained = json.dumps({
+        "telephoto_target": "NGC 7000",
+        "stacked_frames": 42,
+        "connected": True,
+        "not_in_catalog": "junk",
+    }).encode()
+    mqtt_client = _SeedableFakeMqtt(retained=retained)
+    worker = _run_cycles(
+        _ScriptedAlpaca(event_states=[{}], connected=False),
+        mqtt_client, monkeypatch, cycles=1)
+    state = _state_payloads(mqtt_client, worker)[-1]
+    assert state["telephoto_target"] == "NGC 7000"
+    assert state["stacked_frames"] == 42
+    assert "not_in_catalog" not in state
+    assert state["connected"] is False  # this cycle's truth, not the stale seed
+    # The one-shot subscription is cleaned up: subscribed once, unsubscribed
+    # once, and no per-topic callback left behind on the shared client.
+    assert mqtt_client.subscribed == [worker.state_topic]
+    assert mqtt_client.unsubscribed == [worker.state_topic]
+    assert mqtt_client.callbacks == {}
+
+
+def test_malformed_retained_seed_is_ignored(monkeypatch):
+    # Non-UTF-8, non-JSON, and non-object retained payloads are all ignored:
+    # the worker starts empty rather than crashing or seeding garbage.
+    for retained in (b"\xff\xfe\xfd", b"not json", b"[1, 2, 3]"):
+        mqtt_client = _SeedableFakeMqtt(retained=retained)
+        worker = _run_cycles(
+            _ScriptedAlpaca(event_states=[{}], connected=True),
+            mqtt_client, monkeypatch, cycles=1)
+        state = _state_payloads(mqtt_client, worker)[-1]
+        assert "telephoto_target" not in state, retained
+        assert state["connected"] is True
+
+
+def test_absent_retained_seed_starts_empty(monkeypatch):
+    # No retained payload on the topic: the bounded wait elapses and the
+    # worker starts empty — the first cycle publishes only what it observed.
+    monkeypatch.setattr("seestar_bridge.scope._SEED_TIMEOUT_SEC", 0.01)
+    mqtt_client = _SeedableFakeMqtt(retained=None)
+    worker = _run_cycles(
+        _ScriptedAlpaca(event_states=[{"PiStatus": {"temp": 40.0}}], connected=True),
+        mqtt_client, monkeypatch, cycles=1)
+    state = _state_payloads(mqtt_client, worker)[-1]
+    assert state["temperature"] == 40.0
+    assert "telephoto_target" not in state
+    assert mqtt_client.unsubscribed == [worker.state_topic]
 
 
 # --- preview fetch/decode hardening (BLOCKER 3) --------------------------------

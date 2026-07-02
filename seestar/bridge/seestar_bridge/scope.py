@@ -18,7 +18,10 @@ fetch + downscale the saved stack preview whenever a new ``SaveImage`` lands;
 grab one live ``/vid`` frame per cycle while THIS bridge owns the session (see
 the ownership notes on :meth:`ScopeWorker._track_session_ownership`); and
 publish the per-scope availability ('online' only when the scope is actually
-reachable) + the state JSON each cycle.
+reachable) + the state JSON each cycle. The state JSON is a LAST-KNOWN merged
+snapshot (seeded from the bridge's own retained topic at startup), so neither
+a seestar_alp restart nor an add-on restart blanks the dashboard (see the
+``_CYCLE_FRESH_KEYS`` block).
 """
 from __future__ import annotations
 
@@ -111,6 +114,39 @@ _AVAILABILITY_MODE_ALL = "all"
 #: Entity key for the connectivity binary_sensor; set every cycle from the
 #: scope's Alpaca ``connected`` property so the sensor reflects reality.
 _CONNECTED_KEY = "connected"
+
+# --- last-known state cache (driver/add-on restart resilience) -------------------
+#
+# A seestar_alp restart mid-observation wipes the driver's event cache — the
+# scope only re-sends e.g. the View target on the NEXT goto — so a state JSON
+# rebuilt fresh each cycle would overwrite the retained full snapshot with a
+# sparse one and blank the dashboard. Instead each worker keeps a persistent
+# merged snapshot: a key present this cycle updates it, a key absent keeps its
+# last-known value, and a key NEVER observed stays absent (HA renders
+# 'unknown' — the honest "I don't know"). Staleness while the scope is
+# unreachable is masked by the per-scope availability topic going offline (HA
+# marks the entities unavailable), so persisting is safe for every key except
+# the ones below.
+
+#: Keys that must be recomputed EVERY cycle and are therefore never seeded
+#: from the retained snapshot: ``connected`` is live reachability — serving a
+#: stale ``True`` would claim a link that may no longer exist. It is set
+#: unconditionally each cycle in :meth:`ScopeWorker.run`, so the merge can
+#: never leave it stale either. Everything else persists deliberately:
+#: ``slewing`` is derived from goto events and recomputed on every successful
+#: poll anyway, and the remaining keys are telemetry whose last-known value is
+#: exactly what the dashboard should show across a driver restart.
+_CYCLE_FRESH_KEYS = frozenset({_CONNECTED_KEY})
+
+#: The known entity catalog's keys — the only keys the startup seed may
+#: restore from the retained state topic (defensive against leftovers from an
+#: older schema still retained on the broker).
+_CATALOG_KEYS = frozenset(entity.key for entity in ENTITIES)
+
+#: How long the one-shot startup read of our own retained state topic waits
+#: for the broker to replay the retained snapshot before giving up (the seed
+#: is best-effort; an absent payload just means starting empty).
+_SEED_TIMEOUT_SEC = 2.0
 
 _CAMERA_COMPONENT = "camera"
 _CAMERA_KEY = "preview"
@@ -376,6 +412,12 @@ class ScopeWorker:
         self._stored_inputs: dict[str, str] = {
             control.IMAGING_MODE_KEY: control.DEFAULT_IMAGING_MODE,
         }
+        # Last-known merged state snapshot (see the _CYCLE_FRESH_KEYS block):
+        # seeded once from our own retained state topic at startup, then merged
+        # set-when-present each cycle so a driver restart's sparse events never
+        # blank the published JSON. Only ever touched from the worker thread
+        # (the seed runs at the top of run(), before the loop), so no lock.
+        self._published_state: dict[str, Any] = {}
 
     # -- identity / topics ------------------------------------------------------
 
@@ -1189,6 +1231,86 @@ class ScopeWorker:
         if lat not in _SITE_UNSET_VALUES and lon not in _SITE_UNSET_VALUES:
             self.set_site_location(float(lat), float(lon))
 
+    # -- last-known state cache ---------------------------------------------------
+
+    def _seed_last_known_state(self) -> None:
+        """Seed the merged snapshot from our OWN retained state topic, once.
+
+        An add-on restart would otherwise blank every value until the scope
+        re-sends it (which for e.g. the View target only happens on the next
+        goto). So before the first publish, the worker does a one-shot
+        subscribe to ``seestar/<device>/state`` and waits briefly
+        (:data:`_SEED_TIMEOUT_SEC`) for the broker to replay the retained
+        snapshot this bridge itself published before the restart.
+
+        The per-topic ``message_callback_add`` route is used deliberately: it
+        fires INSTEAD of the shared client's routed ``on_message`` (which
+        drops retained messages as command replays), so the seed never
+        interferes with the command path. Everything here is best-effort — a
+        client without the one-shot subscribe API (a minimal test double), a
+        subscribe failure, or a malformed/absent payload all just mean
+        starting empty, never a dead worker.
+        """
+        client = self._mqtt
+        required = ("message_callback_add", "message_callback_remove",
+                    "subscribe", "unsubscribe")
+        if not all(hasattr(client, name) for name in required):
+            _log.debug("%s: MQTT client lacks the one-shot subscribe API; "
+                       "skipping the retained-state seed", self._device_id)
+            return
+        arrived = threading.Event()
+        payloads: list[Any] = []
+
+        def _on_retained(_client, _userdata, message) -> None:
+            payloads.append(message.payload)
+            arrived.set()
+
+        try:
+            client.message_callback_add(self.state_topic, _on_retained)
+            try:
+                client.subscribe(self.state_topic)
+                arrived.wait(_SEED_TIMEOUT_SEC)
+                client.unsubscribe(self.state_topic)
+            finally:
+                client.message_callback_remove(self.state_topic)
+        except Exception:  # noqa: BLE001 — a failed seed must never kill the worker
+            _log.warning("%s: retained-state seed failed; starting empty",
+                         self._device_id, exc_info=True)
+            return
+        if not payloads:
+            _log.info("%s: no retained state to seed from; starting empty",
+                      self._device_id)
+            return
+        seeded = self._parse_retained_seed(payloads[0])
+        if seeded:
+            self._published_state.update(seeded)
+            _log.info("%s: seeded %d last-known fields from retained state",
+                      self._device_id, len(seeded))
+
+    def _parse_retained_seed(self, payload: Any) -> dict[str, Any]:
+        """Filter one retained state payload down to seedable catalog fields.
+
+        A malformed payload (non-UTF-8, non-JSON, or not a JSON object) is
+        logged and ignored. Only keys in the known entity catalog are kept —
+        an older schema's leftovers retained on the broker must not resurface
+        — and the freshness-computed :data:`_CYCLE_FRESH_KEYS` (``connected``)
+        are never seeded: live reachability is recomputed every cycle.
+        """
+        try:
+            if isinstance(payload, (bytes, bytearray)):
+                payload = payload.decode("utf-8")
+            retained = json.loads(payload)
+        except (UnicodeDecodeError, ValueError):
+            _log.warning("%s: ignoring malformed retained state payload",
+                         self._device_id)
+            return {}
+        if not isinstance(retained, dict):
+            _log.warning("%s: ignoring non-object retained state payload",
+                         self._device_id)
+            return {}
+        return {key: value for key, value in retained.items()
+                if key in _CATALOG_KEYS and key not in _CYCLE_FRESH_KEYS}
+
     # -- the poll loop ----------------------------------------------------------
 
     def run(self) -> None:
@@ -1207,10 +1329,19 @@ class ScopeWorker:
         Each cycle publishes the per-scope availability topic ``online`` only when
         the scope is reachable (the event poll succeeded or ``is_connected()``),
         ``offline`` otherwise, and sets the ``connected`` state key the same way.
+        The state JSON is the LAST-KNOWN merged snapshot, not this cycle's raw
+        extraction: the cycle's observations are merged set-when-present into
+        :attr:`_published_state` (seeded once from our own retained topic — see
+        :meth:`_seed_last_known_state` and the :data:`_CYCLE_FRESH_KEYS` block),
+        so a driver restart's sparse events never blank the dashboard.
         The live camera piggybacks on the same cadence: one ``/vid`` frame per
         cycle while the session is owned, its own availability otherwise (see
         :meth:`_maybe_publish_live`).
         """
+        # Seed the last-known snapshot from our own retained state topic so an
+        # ADD-ON restart doesn't blank values either (best-effort, bounded wait).
+        self._seed_last_known_state()
+
         last_slow = 0.0
         slow_backoff_until = 0.0
         slow_fail_streak = 0
@@ -1256,9 +1387,18 @@ class ScopeWorker:
                 # actually answered (or reports connected), never a blind 'online'.
                 availability = _PAYLOAD_AVAILABLE if reachable else _PAYLOAD_NOT_AVAILABLE
                 self._mqtt.publish(self.availability_topic, availability, retain=True)
-                # An unreachable scope publishes only the connectivity flag (so the
-                # Connected sensor flips OFF), not a stale/empty 'online' snapshot.
-                self._mqtt.publish(self.state_topic, json.dumps(state), retain=True)
+                # Merge this cycle's observations into the last-known snapshot
+                # (set-when-present): a key present updates, a key absent keeps
+                # its last-known value — a restarted seestar_alp's wiped event
+                # cache must not blank the retained full state — and a key
+                # never observed stays absent (HA renders 'unknown'). The only
+                # cycle-fresh key, `connected`, was set unconditionally above,
+                # so the merge can never serve it stale; while the scope is
+                # unreachable the availability topic (offline, above) gates
+                # display, so persisting the rest is safe (_CYCLE_FRESH_KEYS).
+                self._published_state.update(state)
+                self._mqtt.publish(
+                    self.state_topic, json.dumps(self._published_state), retain=True)
                 last_preview_file = self._maybe_publish_preview(saved_fullname, last_preview_file)
                 self._maybe_publish_live(reachable)
             except Exception:  # the worker loop must be unkillable (see docstring)

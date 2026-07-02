@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Last-known telemetry survives driver and add-on restarts; unknown values stay
+  honestly unknown. The bridge merges each poll cycle into a persistent
+  per-scope snapshot (seeded once from its own retained MQTT state topic at
+  startup), so a seestar_alp restart's wiped event cache no longer blanks the
+  dashboard; `connected` stays computed fresh every cycle, and keys never
+  observed stay absent.
 - Mount mode now reads instantly from the fork's `get_event_state` mount block
   when available (falls back to `get_device_state` on stock seestar_alp).
 - The add-on image now builds from the Home Assistant **Debian** base
