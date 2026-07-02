@@ -86,7 +86,21 @@ fi
 # --- 3. Bundled-mode config.toml render --------------------------------------
 
 if [ "${has_alpaca_host}" = true ]; then
-    bashio::log.info "External Alpaca driver '$(bashio::config 'alpaca_host')'; not rendering config.toml."
+    alpaca_host="$(bashio::config 'alpaca_host')"
+    bashio::log.info "External Alpaca driver '${alpaca_host}'; not rendering config.toml."
+
+    # The bundled seestar_alp never starts in external mode, so nothing serves
+    # the ingress port (5432). Instead the seestar-alp service slot runs a tiny
+    # info server that links to the operator's own SSC web UI. Compute that URL
+    # here and export it so the info server (with-contenv) can render the link.
+    # Host = alpaca_host with any ':port' stripped (its port is the Alpaca API
+    # port, not the web UI); web-UI port = the alpaca_webui_port option.
+    external_webui_host="${alpaca_host%%:*}"
+    external_webui_port="$(bashio::config 'alpaca_webui_port' "${WEBUI_PORT}")"
+    write_env 'SEESTAR_EXTERNAL_WEBUI_URL' \
+        "http://${external_webui_host}:${external_webui_port}"
+    bashio::log.info \
+        "External seestar_alp web UI at http://${external_webui_host}:${external_webui_port}."
     exit 0
 fi
 

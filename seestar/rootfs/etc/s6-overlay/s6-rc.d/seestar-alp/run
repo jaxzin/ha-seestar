@@ -1,22 +1,23 @@
 #!/command/with-contenv bashio
 # shellcheck shell=bash
 # ==============================================================================
-# seestar-alp longrun — the bundled Alpaca driver.
+# seestar-alp longrun — the bundled Alpaca driver (bundled mode) OR the ingress
+# info page (external mode).
 #
-# Conditional: it runs ONLY in bundled mode (the alpaca_host option blank). In
-# external mode the operator reuses their own seestar_alp, so this service must
-# be a no-op — it brings ITSELF down once (s6-svc -dO) instead of running, so s6
+# Conditional: the real seestar_alp runs ONLY in bundled mode (alpaca_host
+# blank). In external mode the operator reuses their own seestar_alp, so nothing
+# here serves the ingress port (config.yaml ingress_port: 5432) — which used to
+# 502 the "Open Web UI" panel. Instead this slot runs a tiny foreground info
+# server that links out to the external web UI, keeping the process alive so s6
 # does not restart-loop it. init-config has already validated that exactly one of
-# scopes/alpaca_host is set and (in bundled mode) written config.toml.
+# scopes/alpaca_host is set and (in bundled mode) written config.toml, and (in
+# external mode) exported SEESTAR_EXTERNAL_WEBUI_URL for the info server.
 # ==============================================================================
 
 if bashio::config.has_value 'alpaca_host'; then
     bashio::log.info \
-        "External Alpaca driver configured; bundled seestar_alp will not start."
-    # Bring this longrun down now and keep it down: -d takes the service down
-    # immediately, -O clears the restart flag so s6 does not bring it back up.
-    # s6 runs this script with the service directory as CWD, so '.' targets it.
-    exec /command/s6-svc -dO .
+        "External Alpaca driver configured; serving the ingress info page."
+    exec /etc/s6-overlay/scripts/ingress-info-server
 fi
 
 bashio::log.info "Starting bundled seestar_alp driver."

@@ -329,8 +329,9 @@ These are deliberate v1 limitations, documented so they don't surprise you:
    rebuild could pick up an updated base under the same tag.
 4. **The bundled web UI / ingress is live in BUNDLED mode only.** The HA sidebar
    ingress surfaces the *bundled* seestar_alp SSC web UI. In **external** mode the
-   app does not start a driver, so there is no UI to ingress — open your own
-   seestar_alp instance's web UI directly.
+   app does not start a driver, so the **Open Web UI** panel instead shows a small
+   info page that links out to your own seestar_alp instance's web UI (at
+   `alpaca_host`'s host on `alpaca_webui_port`) — open it directly there.
 
    <a id="renaming-a-scope-creates-a-new-device"></a>
 

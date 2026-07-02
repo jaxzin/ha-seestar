@@ -44,6 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- External mode: the Open Web UI panel now shows a link to the external
+  seestar_alp web UI instead of a 502.
 - The per-scope worker loop is now unkillable by a single cycle's exception: a
   truncated imaging-server reply (`http.client.IncompleteRead`) or any other
   unexpected error logs its traceback, publishes `offline` for that cycle, and

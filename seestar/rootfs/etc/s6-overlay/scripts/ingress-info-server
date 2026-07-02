@@ -1,0 +1,121 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# ==============================================================================
+# ingress-info-server — the external-mode stand-in for the bundled web UI.
+#
+# In external mode the bundled seestar_alp never starts, so nothing serves the
+# ingress port (config.yaml ingress_port: 5432). Rather than let the "Open Web
+# UI" panel 502, the seestar-alp service slot runs THIS in external mode: a
+# tiny foreground HTTP server that returns, for any path, a static page linking
+# out to the operator's own seestar_alp SSC web UI (SEESTAR_EXTERNAL_WEBUI_URL,
+# exported by init-config). It runs forever as the service's process.
+#
+# with-contenv (not plain bashio) so it sees SEESTAR_EXTERNAL_WEBUI_URL and the
+# venv PATH s6-overlay stashed in /run/s6/container_environment. python3 comes
+# from /opt/venv (base image PATH); only the stdlib is used.
+# ==============================================================================
+
+bashio::log.info "External mode: serving the ingress info page (no bundled web UI)."
+
+exec python3 <<'PYEOF'
+"""Serve a static 'driver runs externally' info page on the ingress port.
+
+Any path (and HEAD) returns the same 200 text/html page, so HA's ingress proxy
+never 502s. The page is self-contained (inline styles, no external assets, no
+redirect) so it renders inside HA's ingress iframe; it click-throughs to the
+external seestar_alp web UI in a new tab.
+"""
+from __future__ import annotations
+
+import html
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# config.yaml pins ingress_port: 5432; allow an env override for parity with the
+# bundled driver's web-UI port, but default to the ingress port either way.
+PORT = int(os.environ.get("INGRESS_INFO_PORT", "5432"))
+BIND = "0.0.0.0"
+
+# init-config exports this in external mode; empty is not expected here.
+WEBUI_URL = os.environ.get("SEESTAR_EXTERNAL_WEBUI_URL", "").strip()
+
+
+def _render_page() -> bytes:
+    if WEBUI_URL:
+        safe_url = html.escape(WEBUI_URL, quote=True)
+        link = (
+            f'<a class="btn" href="{safe_url}" target="_blank" rel="noopener">'
+            "Open the seestar_alp web UI &rarr;</a>"
+        )
+    else:
+        # Shouldn't happen in external mode, but never render a broken link.
+        link = (
+            '<p class="muted">The external web UI address is not configured. '
+            "Set <code>alpaca_host</code> and <code>alpaca_webui_port</code> in "
+            "the add-on options.</p>"
+        )
+    return (
+        "<!doctype html>"
+        '<html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        "<title>Seestar — External driver mode</title>"
+        "<style>"
+        "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;"
+        "margin:0;padding:2rem;line-height:1.5;color:#e1e1e1;background:#1c1c1c}"
+        ".card{max-width:34rem;margin:0 auto}"
+        "h1{font-size:1.4rem;margin:0 0 .75rem}"
+        "p{margin:0 0 1rem}"
+        ".muted{color:#9a9a9a;font-size:.95rem}"
+        "code{background:#2b2b2b;padding:.1rem .35rem;border-radius:.25rem;"
+        "font-size:.9em}"
+        ".btn{display:inline-block;margin-top:.5rem;padding:.6rem 1.1rem;"
+        "background:#03a9f4;color:#fff;text-decoration:none;border-radius:.4rem;"
+        "font-weight:600}"
+        ".btn:hover{background:#0288d1}"
+        "@media(prefers-color-scheme:light){body{color:#212121;background:#fafafa}"
+        "code{background:#eee}.muted{color:#616161}}"
+        "</style></head><body><div class=\"card\">"
+        "<h1>Seestar — External driver mode</h1>"
+        "<p>The <code>seestar_alp</code> driver runs on an external host, so its "
+        "web UI isn't proxied here. Telemetry and the preview are still published "
+        "to Home Assistant over MQTT.</p>"
+        f"{link}"
+        "</div></body></html>"
+    ).encode("utf-8")
+
+
+_PAGE = _render_page()
+
+
+class InfoHandler(BaseHTTPRequestHandler):
+    def _send(self, *, body: bool) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(_PAGE)))
+        self.end_headers()
+        if body:
+            self.wfile.write(_PAGE)
+
+    def do_GET(self) -> None:  # noqa: N802 (http.server naming)
+        self._send(body=True)
+
+    def do_HEAD(self) -> None:  # noqa: N802 (http.server naming)
+        self._send(body=False)
+
+    def log_message(self, *args: object) -> None:
+        # Silence per-request stderr noise; startup line below is enough.
+        pass
+
+
+def main() -> None:
+    print(
+        f"[ingress-info-server] serving info page on {BIND}:{PORT} "
+        f"(external web UI: {WEBUI_URL or 'unset'})",
+        flush=True,
+    )
+    ThreadingHTTPServer((BIND, PORT), InfoHandler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
