@@ -321,7 +321,7 @@ These are deliberate v1 limitations, documented so they don't surprise you:
    the upstream `requirements.txt` at its pinned tag. The bridge's own
    dependencies **are** hash-pinned (`--require-hashes`).
 3. **The base image is pinned by tag, not by digest.** The Dockerfile builds from
-   `ghcr.io/home-assistant/<arch>-base-python:3.12-alpine3.20` (a tag), so a
+   `ghcr.io/home-assistant/<arch>-base-debian:trixie-2026.06.1` (a tag), so a
    rebuild could pick up an updated base under the same tag.
 4. **The bundled web UI / ingress is live in BUNDLED mode only.** The HA sidebar
    ingress surfaces the *bundled* seestar_alp SSC web UI. In **external** mode the

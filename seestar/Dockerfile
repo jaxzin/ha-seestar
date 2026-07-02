@@ -2,7 +2,13 @@
 # Home Assistant "Seestar" app image: the bundled seestar_alp Alpaca driver plus
 # our seestar_bridge telemetry publisher, supervised by the base image's
 # s6-overlay v3. BUILD_FROM is supplied per-arch from build.yaml (the HA
-# base-python:alpine images already ship s6-overlay + bashio).
+# base-debian images already ship s6-overlay + bashio).
+#
+# Debian (glibc) is deliberate: opencv-python publishes no musllinux wheels, so
+# an Alpine base forces an hours-long source build, while Debian pulls manylinux
+# wheels for every compiled dep (opencv, numpy, pandas, astropy, scikit-image,
+# ephem, Pillow) on both amd64 and aarch64 — nothing heavy compiles here. It
+# also matches upstream seestar_alp's tested environment (ubuntu:24.04).
 ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
@@ -10,34 +16,29 @@ FROM ${BUILD_FROM}
 # re-verify of the /config scrape (see plan Task 9).
 ARG SEESTAR_ALP_REF=v3.2.2
 
-SHELL ["/bin/ash", "-o", "pipefail", "-c"]
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# Build toolchain for the compiled wheels seestar_alp pulls (numpy, pandas,
-# astropy, scikit-image, opencv, cryptography, pyindi). The -dev headers stay in
-# the image as a deliberate tradeoff: a multi-stage slim-down is a follow-up, and
-# the runtime shared libs (libstdc++, mesa-gl, glib, freetype, jpeg) are required
-# at run time by opencv/Pillow regardless.
-# hadolint ignore=DL3018
-RUN apk add --no-cache \
+# Runtime interpreter + the only shared libs the manylinux wheels don't bundle:
+# opencv-python needs libGL (libgl1) and libgthread-2.0 (libglib2.0-0t64 on
+# trixie). git serves the seestar_alp clone and its pyindi git requirement.
+# hadolint ignore=DL3008
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         git \
-        build-base \
-        cmake \
-        linux-headers \
-        pkgconf \
-        python3-dev \
-        libffi-dev \
-        openssl-dev \
-        freetype-dev \
-        jpeg-dev \
-        zlib-dev \
-        libpng-dev \
-        openblas-dev \
-        lapack-dev \
-        gfortran \
-        libstdc++ \
-        libgl \
-        glib \
-        mesa-gl
+        python3 \
+        python3-pip \
+        python3-venv \
+        libgl1 \
+        libglib2.0-0t64 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Debian's system python is PEP 668 externally-managed, so all pip installs go
+# into a dedicated venv. Putting its bin dir first on PATH makes `pip` below and
+# the plain `python3` in the s6 run scripts resolve to the venv interpreter:
+# s6-overlay v3 stashes the container's initial environment (incl. this PATH) in
+# /run/s6/container_environment, and both longruns start via with-contenv.
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
 
 # --- seestar_alp (GPL-3.0, bundled at arm's length over the Alpaca socket) -----
 # Shallow-clone the pinned tag and install its pinned requirements. The four

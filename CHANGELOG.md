@@ -24,6 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (Apache-2.0 + GPL-3.0 attribution), and the `seestar_bridge` Python package
   skeleton with a pytest setup.
 
+### Changed
+
+- The add-on image now builds from the Home Assistant **Debian** base
+  (`base-debian:trixie`, Python 3.13) instead of Alpine: `opencv-python`
+  publishes no musllinux wheels, so the Alpine base forced an hours-long
+  source build, while Debian pulls prebuilt manylinux wheels for every
+  compiled dependency on both amd64 and aarch64. pip installs now live in a
+  `/opt/venv` virtualenv (Debian's system Python is PEP 668
+  externally-managed).
+
 ### Fixed
 
 - The per-scope worker loop is now unkillable by a single cycle's exception: a
