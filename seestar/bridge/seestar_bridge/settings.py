@@ -47,6 +47,12 @@ _HA_TO_PYTHON_LEVEL = {
 BUNDLED_ALPACA_HOST = "localhost:5555"
 DEFAULT_ALPACA_WEBUI_PORT = 5432
 
+# seestar_alp's imaging server (the live ``/vid`` MJPEG stream the Phase-2 live
+# camera taps) binds this port on the SAME host as the Alpaca endpoint — both
+# bundled mode and stock external installs use it. The ``imaging_port`` option
+# only needs changing for an external seestar_alp rebound elsewhere.
+DEFAULT_IMAGING_PORT = 7556
+
 # Where the bundled seestar_alp config.toml lives inside the image; the
 # init-config oneshot writes it from the ``scopes`` option, and discovery reads
 # it back for scope-address resolution. Only meaningful in bundled mode.
@@ -75,6 +81,9 @@ class Settings:
     preview_max_px: int
     log_level: str
     mqtt: MqttSettings
+    #: Port of seestar_alp's imaging server on the Alpaca host; the live camera
+    #: grabs frames from ``http://<alpaca host>:<imaging_port>/<device_num>/vid``.
+    imaging_port: int = DEFAULT_IMAGING_PORT
 
 
 def _as_bool(value, default=False):
@@ -204,4 +213,5 @@ def load_settings(options, env):
         preview_max_px=int(options.get("preview_max_px", DEFAULT_PREVIEW_MAX_PX)),
         log_level=_resolve_log_level(options.get("log_level")),
         mqtt=_resolve_mqtt(options, env),
+        imaging_port=int(options.get("imaging_port", DEFAULT_IMAGING_PORT)),
     )

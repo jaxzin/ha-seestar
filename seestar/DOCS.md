@@ -68,6 +68,7 @@ Setting **both** `scopes` and `alpaca_host` is rejected at startup; so is settin
 | `scopes` | list of `{name, host}` | `[]` | **Bundled mode only.** One entry per telescope. `name` is the HA device name (see the [naming caveat](#renaming-a-scope-creates-a-new-device)); `host` is the scope's LAN IP or hostname. Each becomes its own HA device. Leave empty in external mode. |
 | `alpaca_host` | string | `""` | Blank = run the bundled driver. Set to `host:port` of your own seestar_alp to reuse it (and leave `scopes` empty). |
 | `alpaca_webui_port` | port | `5432` | **External mode only.** The port your seestar_alp serves its config on, used to look up each scope's address for the preview. |
+| `imaging_port` | port | `7556` | Port of seestar_alp's imaging server on the Alpaca host, where the Live view camera grabs its `/vid` MJPEG frames. Change only for an external seestar_alp bound to a non-stock imaging port. |
 | `mqtt_host` | string | `""` | Blank = use the Mosquitto add-on via the Supervisor. Set to override with another broker. |
 | `mqtt_port` | port | `0` | `0` = take the port from the Supervisor service. Set explicitly (e.g. `1883`, or `8883` for TLS) when overriding `mqtt_host`. |
 | `mqtt_username` | string | `""` | Broker username. Leave blank with the Mosquitto add-on. |
@@ -81,8 +82,12 @@ Setting **both** `scopes` and `alpaca_host` is rejected at startup; so is settin
 
 ## What gets published
 
-Per telescope, one HA device with ~46 entities plus a `camera` for the live
-stacked preview:
+Per telescope, one HA device with ~46 entities plus two `camera` entities: the
+saved stacked preview, and a **Live view** camera fed from seestar_alp's `/vid`
+stream. The live camera only shows frames while a session was started *through
+this bridge* (the firmware only serves live frames to the session's owning
+client); otherwise it reads unavailable while the stacked preview keeps working
+independently. Entities:
 
 - **Cameras**: telephoto (cam 0) and wide-field (cam 1) target / state / mode /
   gain / LP-filter, plus the active camera.

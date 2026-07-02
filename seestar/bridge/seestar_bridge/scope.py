@@ -15,7 +15,9 @@ process can drive a distinct HA device per scope.
 ``event_poll_sec``; probe ``get_device_state`` on a slow cadence with the
 Phase-1 exponential backoff (it only answers when the scope is briefly idle);
 fetch + downscale the saved stack preview whenever a new ``SaveImage`` lands;
-and publish the per-scope availability ('online' only when the scope is actually
+grab one live ``/vid`` frame per cycle while THIS bridge owns the session (see
+the ownership notes on :meth:`ScopeWorker._track_session_ownership`); and
+publish the per-scope availability ('online' only when the scope is actually
 reachable) + the state JSON each cycle.
 """
 from __future__ import annotations
@@ -23,6 +25,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -101,6 +104,14 @@ _CAMERA_COMPONENT = "camera"
 _CAMERA_KEY = "preview"
 _CAMERA_NAME = "Live stacked preview"
 
+#: Phase-2 live camera: fed from seestar_alp's imaging server ``/vid`` MJPEG
+#: stream, published on its OWN sub-topic (``seestar/<device>/live``) with its
+#: OWN availability topic underneath it, so the not-owned state can gray out
+#: the live camera without touching the Phase-1 saved-stack preview.
+_LIVE_CAMERA_KEY = "live_view"
+_LIVE_CAMERA_NAME = "Live view"
+_LIVE_SUBTOPIC = "live"
+
 #: Discovery component for the ad-hoc last-command-result sensor (published
 #: directly here, like the camera, because its state topic is not the shared
 #: per-scope state JSON that entities.discovery_payload assumes).
@@ -148,6 +159,32 @@ _STATEFUL_DISPATCH_COMPONENTS = frozenset({
     control.COMPONENT_TEXT,
 })
 
+# --- session ownership (gates the live camera) -----------------------------------
+#
+# seestar_alp's :7556/vid MJPEG stream only serves real frames to the client
+# that OWNS the imaging session; a passive observer receives an Idle
+# placeholder. That firmware boundary is surfaced, not worked around: the live
+# camera only polls the stream while THIS bridge owns the session, i.e. after a
+# session-starting command dispatched OK through the bridge's own command path.
+
+#: Dispatch-catalog keys whose OK dispatch makes seestar_alp (and therefore this
+#: bridge) the owning client: iscope_start_view, start_stack, and the scheduler
+#: run (which itself issues iscope_start_view). Guarded against catalog drift by
+#: test_session_tracking_keys_exist_in_dispatch_catalog.
+_SESSION_START_KEYS = frozenset({"start_live_view", "start_stack", "run_plan"})
+
+#: Dispatch-catalog keys whose OK dispatch ends (or stows/powers off) the
+#: session, clearing ownership.
+_SESSION_END_KEYS = frozenset({"stop", "park", "shutdown"})
+
+#: View event ``state`` values that mark the session as over. Ownership is
+#: confirmed on every poll from the non-blocking ``get_event_state`` tap the
+#: loop already makes (no extra RPC): an explicitly-ended View clears the flag;
+#: an absent View block carries no information and keeps it. The set mirrors
+#: seestar_alp's OWN terminal states (device/seestar_device.py
+#: ``terminal_states = {"complete", "fail", "cancel"}``).
+_VIEW_ENDED_STATES = frozenset({"complete", "fail", "cancel"})
+
 # --- HTTP + backoff constants --------------------------------------------------
 
 #: The scope writes both a .fit and a viewable .jpg under MyWorks/; we fetch the
@@ -155,9 +192,23 @@ _STATEFUL_DISPATCH_COMPONENTS = frozenset({
 _FIT_SUFFIX = ".fit"
 _JPG_SUFFIX = ".jpg"
 _JPEG_MAGIC = b"\xff\xd8"
+_JPEG_END_MAGIC = b"\xff\xd9"
 
 _PREVIEW_TIMEOUT_SEC = 30
 _JPEG_QUALITY = 85
+
+#: Live MJPEG stream constants (Phase-1 validated ``grab_preview`` parser). The
+#: stream lives at ``/<device_num>/vid`` on the imaging port; parts are
+#: delimited by seestar_alp's boundary (device/seestar_imaging.py:
+#: ``BOUNDARY = b"\r\n--frame\r\n"``), each carrying its own Content-Type
+#: header block terminated by a blank line. Only an ``image/jpeg`` part with
+#: real JPEG start/end markers is a frame — the idle placeholder is a (large)
+#: GIF part and must never be published.
+_LIVE_STREAM_PATH = "vid"
+_MJPEG_BOUNDARY = b"--frame"
+_MJPEG_HEADER_END = b"\r\n\r\n"
+_MJPEG_JPEG_CONTENT_TYPE = b"image/jpeg"
+_MJPEG_CHUNK_BYTES = 64 * 1024
 
 #: Hard cap on the preview body we fetch + decode. The scope's stacked .jpg is a
 #: few MiB; anything over this is either not the file we expect or an attempt to
@@ -236,6 +287,8 @@ class ScopeWorker:
         self._mqtt = mqtt_client
         self._scope_http_base = scope_http_base.rstrip("/") if scope_http_base else None
         device_num = device.get("DeviceNumber")
+        #: Device number on the imaging server too (the /vid path segment).
+        self._device_num = device_num
         # Stable HA device id = slug of the scope name (caller may override to
         # disambiguate a name collision by device_num). Apply the same empty-slug
         # fallback main.assign_device_ids uses so an unnamed scope can never
@@ -255,6 +308,12 @@ class ScopeWorker:
         # are isolated per worker, so arming one scope never arms another.
         self._controls_enabled = False
         self._allow_power = False
+        # Session ownership (gates the live camera; see the _SESSION_* constants).
+        # Written by paho's command thread (_track_session_ownership) and by the
+        # poll thread (_refresh_session_ownership), read by the poll thread every
+        # cycle — so all access goes through the lock, never the bare attribute.
+        self._session_owned = False
+        self._session_lock = threading.Lock()
         # Value-only stored inputs (imaging mode; goto target/RA/Dec): updated by
         # their command topics WITHOUT any Alpaca call, consumed by the trigger
         # buttons' dispatch. Imaging mode starts at the documented default.
@@ -283,6 +342,16 @@ class ScopeWorker:
     @property
     def preview_topic(self) -> str:
         return f"{self.base_topic}/{_PREVIEW_SUBTOPIC}"
+
+    @property
+    def live_topic(self) -> str:
+        """Where the live ``/vid`` camera's JPEG frames are published."""
+        return f"{self.base_topic}/{_LIVE_SUBTOPIC}"
+
+    @property
+    def live_availability_topic(self) -> str:
+        """The live camera's OWN availability topic: ``offline`` when not owned."""
+        return f"{self.live_topic}/{_AVAILABILITY_SUBTOPIC}"
 
     @property
     def command_result_topic(self) -> str:
@@ -530,6 +599,27 @@ class ScopeWorker:
         }
         camera_topic = f"{prefix}/{_CAMERA_COMPONENT}/{self._device_id}/{_CAMERA_KEY}/config"
         self._mqtt.publish(camera_topic, json.dumps(camera), retain=True)
+        # Phase-2 live camera: its availability list ADDS its own ownership
+        # topic to the shared bridge + scope pair, so HA grays it out whenever
+        # this bridge does not own the session (the :7556/vid firmware boundary)
+        # while the Phase-1 saved-stack preview above stays independent.
+        live_camera = {
+            "name": _LIVE_CAMERA_NAME,
+            "unique_id": f"{self._device_id}_{_LIVE_CAMERA_KEY}",
+            "object_id": f"{self._device_id}_{_LIVE_CAMERA_KEY}",
+            "topic": self.live_topic,
+            "availability": availability_list(
+                self._bridge_availability_topic, self.availability_topic,
+                self.live_availability_topic),
+            "availability_mode": _AVAILABILITY_MODE_ALL,
+            "device": block,
+        }
+        live_camera_topic = (
+            f"{prefix}/{_CAMERA_COMPONENT}/{self._device_id}/{_LIVE_CAMERA_KEY}/config")
+        self._mqtt.publish(live_camera_topic, json.dumps(live_camera), retain=True)
+        # Seed the live camera unavailable (retained): a cold-started bridge
+        # owns no session, and HA must render that as offline, not 'unknown'.
+        self._publish_live_availability(False)
         # Operator-visible dispatch outcome: a plain sensor fed by the per-scope
         # command_result topic, so a REFUSED/ERROR command shows up in HA (with
         # its reason) instead of vanishing into the bridge log.
@@ -686,8 +776,10 @@ class ScopeWorker:
             allow_power=self._allow_power,
             stored=self._stored_inputs,
         )
-        if result.status is DispatchStatus.OK and self._control_is_stateful(key):
-            self._publish_control_state(key, payload)
+        if result.status is DispatchStatus.OK:
+            self._track_session_ownership(key)
+            if self._control_is_stateful(key):
+                self._publish_control_state(key, payload)
         self._publish_command_result(result.status.value, result.reason or key)
 
     def _publish_command_result(self, status: str, detail: str) -> None:
@@ -708,6 +800,56 @@ class ScopeWorker:
         """
         ctl = control.control_for(key)
         return ctl is not None and ctl.component in _STATEFUL_DISPATCH_COMPONENTS
+
+    # -- session ownership (gates the live camera) -------------------------------
+
+    @property
+    def session_owned(self) -> bool:
+        """True while THIS bridge owns the imaging session (lock-guarded read)."""
+        with self._session_lock:
+            return self._session_owned
+
+    def _set_session_owned(self, owned: bool, *, reason: str) -> None:
+        """Flip the ownership flag under the lock, logging every transition.
+
+        Ownership decides whether the imaging port is polled at all, so a
+        transition is operationally significant and never silent.
+        """
+        with self._session_lock:
+            changed = self._session_owned != owned
+            self._session_owned = owned
+        if changed:
+            _log.info("%s: session ownership -> %s (%s)",
+                      self._device_id, "owned" if owned else "not owned", reason)
+
+    def _track_session_ownership(self, key: str) -> None:
+        """Update ownership from one OK dispatch (called on paho's thread).
+
+        A session-starting command (start_live_view / start_stack / run_plan)
+        dispatched OK makes seestar_alp — and therefore this bridge — the
+        owning client of the ``/vid`` stream; a stop-class command (stop /
+        park / shutdown) ends that. Every other control leaves the flag alone.
+        """
+        if key in _SESSION_START_KEYS:
+            self._set_session_owned(True, reason=f"{key} dispatched ok")
+        elif key in _SESSION_END_KEYS:
+            self._set_session_owned(False, reason=f"{key} dispatched ok")
+
+    def _refresh_session_ownership(self, event_state: Any) -> None:
+        """Confirm ownership against the event tap (called on the poll thread).
+
+        Uses the ``View`` state from the non-blocking ``get_event_state`` the
+        loop already polls every cycle (rather than an extra ``get_video_status``
+        RPC): a View in one of seestar_alp's own terminal states means the
+        session ended out from under us (phone app stop, plan completion,
+        failure), so ownership is dropped — the confirmation failed. An absent
+        View block carries no information and keeps the current flag.
+        """
+        if not self.session_owned:
+            return
+        view_state = _nav(event_state, "View", "state")
+        if isinstance(view_state, str) and view_state.lower() in _VIEW_ENDED_STATES:
+            self._set_session_owned(False, reason=f"View state {view_state!r}")
 
     def fetch_preview(self, fullname: str) -> bytes | None:
         """Fetch the saved stacked .jpg from the scope's HTTP server, downscaled.
@@ -799,6 +941,112 @@ class ScopeWorker:
             _log.warning("%s: preview decode failed; skipping: %s", self._device_id, exc)
             return None
 
+    # -- live /vid camera ---------------------------------------------------------
+
+    def _imaging_stream_url(self) -> str:
+        """This scope's live MJPEG stream on seestar_alp's imaging server.
+
+        Derived from the Alpaca base's host (the imaging server always runs
+        beside the Alpaca endpoint) plus the ``imaging_port`` setting (default
+        7556, seestar_alp's stock bind) and the device number.
+        """
+        host = urllib.parse.urlsplit(self._settings.alpaca_base).hostname
+        return (f"http://{host}:{self._settings.imaging_port}"
+                f"/{self._device_num}/{_LIVE_STREAM_PATH}")
+
+    def grab_live_frame(self) -> bytes | None:
+        """Read ONE fresh JPEG out of the live MJPEG stream, downscaled.
+
+        Ported from the validated Phase-1 ``grab_preview``: the imaging server
+        multiplexes multipart parts each with its own Content-Type — when no
+        live frame is available it serves a (large) loading GIF — so the
+        boundary is parsed and only a completed ``image/jpeg`` part with real
+        JPEG start/end markers is accepted; anything else (the GIF, a
+        malformed body) is skipped, never published. Both the wall time and
+        the buffered bytes are bounded (:data:`_PREVIEW_TIMEOUT_SEC` /
+        :data:`_MAX_PREVIEW_BYTES`) so a slow or bloated stream can neither
+        stall the poll loop past the preview timeout nor exhaust memory.
+        Returns the downscaled JPEG (via the shared Pillow path), or ``None``
+        when no acceptable frame arrived within bounds; transport errors
+        propagate to the caller's guard.
+        """
+        deadline = time.monotonic() + _PREVIEW_TIMEOUT_SEC
+        buf = b""
+        with urllib.request.urlopen(
+                self._imaging_stream_url(), timeout=_PREVIEW_TIMEOUT_SEC) as resp:
+            while time.monotonic() < deadline:
+                chunk = resp.read(_MJPEG_CHUNK_BYTES)
+                if not chunk:
+                    break  # stream ended without a usable frame
+                buf += chunk
+                frame, buf = self._next_jpeg_part(buf)
+                if frame is not None:
+                    return self._decode_preview(frame)
+                if len(buf) > _MAX_PREVIEW_BYTES:
+                    _log.warning(
+                        "%s: live stream part exceeds cap %d; giving up this cycle",
+                        self._device_id, _MAX_PREVIEW_BYTES)
+                    break
+        return None
+
+    @staticmethod
+    def _next_jpeg_part(buf: bytes) -> tuple[bytes | None, bytes]:
+        """Scan the completed multipart parts in ``buf`` for the first real JPEG.
+
+        Returns ``(jpeg_body, remaining_buffer)`` when a completed
+        ``image/jpeg`` part with valid SOI/EOI markers is present. Otherwise
+        returns ``(None, remaining_buffer)`` with every completed non-JPEG
+        part (the loading GIF, a mislabeled/truncated body) consumed, so the
+        buffer only ever retains the still-incomplete tail of the stream.
+        """
+        while True:
+            start = buf.find(_MJPEG_BOUNDARY)
+            header_end = buf.find(_MJPEG_HEADER_END, start) if start >= 0 else -1
+            if header_end < 0:
+                return None, buf  # part headers not fully buffered yet
+            body_start = header_end + len(_MJPEG_HEADER_END)
+            next_part = buf.find(_MJPEG_BOUNDARY, body_start)
+            if next_part < 0:
+                return None, buf  # part body not fully buffered yet
+            headers = buf[start:header_end].lower()
+            body = buf[body_start:next_part].rstrip(b"\r\n")
+            buf = buf[next_part:]
+            if (_MJPEG_JPEG_CONTENT_TYPE in headers
+                    and body[:len(_JPEG_MAGIC)] == _JPEG_MAGIC
+                    and body[-len(_JPEG_END_MAGIC):] == _JPEG_END_MAGIC):
+                return body, buf
+
+    def _maybe_publish_live(self, reachable: bool) -> None:
+        """Publish one live frame + the live availability for this cycle.
+
+        The live camera is HARD-GATED on session ownership: when this bridge
+        does not own the session (or the scope is unreachable this cycle) the
+        imaging port is NOT polled at all — a passive observer would only
+        receive the Idle placeholder (the firmware boundary; surfaced, not
+        worked around) — and the camera's own availability topic reads
+        ``offline``. When owned, ONE fresh frame is grabbed per poll cycle; a
+        grab failure is logged, marks just this cycle unavailable (ownership
+        is kept — the next cycle retries), and leaves the telemetry that was
+        already published this cycle untouched.
+        """
+        if not (reachable and self.session_owned):
+            self._publish_live_availability(False)
+            return
+        try:
+            frame = self.grab_live_frame()
+        except (*_PROBE_ERRORS, *_pillow_decode_errors()) as exc:
+            _log.warning("%s: live frame grab failed; live view offline this cycle: %s",
+                         self._device_id, exc)
+            frame = None
+        if frame:
+            self._mqtt.publish(self.live_topic, frame, qos=0, retain=True)
+        self._publish_live_availability(frame is not None)
+
+    def _publish_live_availability(self, available: bool) -> None:
+        """Publish the live camera's own availability (retained) for this cycle."""
+        payload = _PAYLOAD_AVAILABLE if available else _PAYLOAD_NOT_AVAILABLE
+        self._mqtt.publish(self.live_availability_topic, payload, retain=True)
+
     def ensure_site_location(self) -> None:
         """Acquire + cache the scope's GPS site once (for Alt/Az); never published.
 
@@ -825,6 +1073,9 @@ class ScopeWorker:
         Each cycle publishes the per-scope availability topic ``online`` only when
         the scope is reachable (the event poll succeeded or ``is_connected()``),
         ``offline`` otherwise, and sets the ``connected`` state key the same way.
+        The live camera piggybacks on the same cadence: one ``/vid`` frame per
+        cycle while the session is owned, its own availability otherwise (see
+        :meth:`_maybe_publish_live`).
         """
         last_slow = 0.0
         slow_backoff_until = 0.0
@@ -874,6 +1125,7 @@ class ScopeWorker:
             # Connected sensor flips OFF), not a stale/empty 'online' snapshot.
             self._mqtt.publish(self.state_topic, json.dumps(state), retain=True)
             last_preview_file = self._maybe_publish_preview(saved_fullname, last_preview_file)
+            self._maybe_publish_live(reachable)
             time.sleep(event_poll)
 
     def _poll_once(self, now: float):
@@ -892,6 +1144,9 @@ class ScopeWorker:
             _log.warning("%s: event poll failed: %s", self._device_id, exc)
             return {}, None, False
         state = self.build_state(event_state if isinstance(event_state, dict) else {}, unix_t=now)
+        # Confirm the owned-session flag against this same event snapshot (a
+        # View in a terminal state means the session ended out from under us).
+        self._refresh_session_ownership(event_state)
         self._ensure_site_location_safe()
         if (self._site_lat is not None and state.get("ra") is not None
                 and "altitude" not in state):
