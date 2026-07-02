@@ -16,7 +16,7 @@ if bashio::config.has_value 'alpaca_host'; then
     # Bring this longrun down now and keep it down: -d takes the service down
     # immediately, -O clears the restart flag so s6 does not bring it back up.
     # s6 runs this script with the service directory as CWD, so '.' targets it.
-    exec /run/s6/basedir/bin/s6-svc -dO .
+    exec /command/s6-svc -dO .
 fi
 
 bashio::log.info "Starting bundled seestar_alp driver."
