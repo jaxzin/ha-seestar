@@ -409,6 +409,109 @@ def test_stop_maps_to_stop_scheduler():
     assert alpaca.calls[0][0] == "stop_scheduler"
 
 
+# -- Phase-2 spec-catalog additions: gain / tracking / wide-cam / AF / record ------
+
+def test_gain_maps_to_set_setting_isp_gain():
+    # Verified against seestar_alp front/app.py LiveGainResource: the web UI's
+    # own gain control is method_sync set_setting {"isp_gain": <0..300>}.
+    alpaca = _StubAlpaca()
+    result = dispatch(alpaca, "gain", "120", controls_enabled=True, allow_power=False)
+    assert result.status is DispatchStatus.OK
+    name, params = alpaca.calls[0]
+    assert name == "method_sync"
+    assert params == {"method": "set_setting", "params": {"isp_gain": 120}}
+
+
+def test_gain_range_matches_the_upstream_ui_bounds():
+    gain = _control("gain")
+    assert gain.min_value == control.GAIN_MIN == 0
+    assert gain.max_value == control.GAIN_MAX == 300
+
+
+def test_gain_out_of_range_refused_without_alpaca_call():
+    alpaca = _StubAlpaca()
+    result = dispatch(
+        alpaca, "gain", control.GAIN_MAX + 1, controls_enabled=True, allow_power=False)
+    assert result.status is DispatchStatus.REFUSED
+    assert alpaca.calls == []
+
+
+@pytest.mark.parametrize("payload,expected", [("ON", True), ("OFF", False)])
+def test_tracking_switch_maps_to_scope_set_track_state(payload, expected):
+    # Verified wire shape: params is a BARE BOOL (seestar_alp's own Bruno API
+    # collection and its bundled CLI client both send it that way).
+    alpaca = _StubAlpaca()
+    result = dispatch(
+        alpaca, "tracking_set", payload, controls_enabled=True, allow_power=False)
+    assert result.status is DispatchStatus.OK
+    name, params = alpaca.calls[0]
+    assert name == "method_sync"
+    assert params == {"method": "scope_set_track_state", "params": expected}
+
+
+@pytest.mark.parametrize("payload,expected", [("ON", True), ("OFF", False)])
+def test_wide_cam_switch_maps_to_set_setting(payload, expected):
+    # Verified against seestar_alp front/app.py LiveWideCamResource:
+    # method_sync set_setting {"wide_cam": <bool>}.
+    alpaca = _StubAlpaca()
+    result = dispatch(
+        alpaca, "wide_cam", payload, controls_enabled=True, allow_power=False)
+    assert result.status is DispatchStatus.OK
+    name, params = alpaca.calls[0]
+    assert name == "method_sync"
+    assert params == {"method": "set_setting", "params": {"wide_cam": expected}}
+
+
+def test_auto_focus_button_uses_the_upstream_spelling():
+    # The firmware RPC really is spelled 'start_auto_focuse' (sic) — verified in
+    # seestar_alp device/seestar_device.py and front/app.py, which both send it.
+    alpaca = _StubAlpaca()
+    result = dispatch(
+        alpaca, "auto_focus", {}, controls_enabled=True, allow_power=False)
+    assert result.status is DispatchStatus.OK
+    name, params = alpaca.calls[0]
+    assert name == "method_sync"
+    assert params == {"method": "start_auto_focuse"}
+
+
+def test_record_video_on_starts_and_off_stops_avi_recording():
+    # Verified against seestar_alp front/app.py LiveVideoResource: start is
+    # method_sync start_record_avi {"raw": bool} (the UI's default form post is
+    # non-raw), stop is method_sync stop_record_avi with no params.
+    on_alpaca = _StubAlpaca()
+    result = dispatch(
+        on_alpaca, "record_video", "ON", controls_enabled=True, allow_power=False)
+    assert result.status is DispatchStatus.OK
+    assert on_alpaca.calls == [
+        ("method_sync", {"method": "start_record_avi", "params": {"raw": False}})]
+
+    off_alpaca = _StubAlpaca()
+    result = dispatch(
+        off_alpaca, "record_video", "OFF", controls_enabled=True, allow_power=False)
+    assert result.status is DispatchStatus.OK
+    assert off_alpaca.calls == [("method_sync", {"method": "stop_record_avi"})]
+
+
+_NEW_CONTROL_KEYS = ("gain", "tracking_set", "wide_cam", "auto_focus", "record_video")
+
+
+@pytest.mark.parametrize("key", _NEW_CONTROL_KEYS)
+def test_new_controls_are_gate_refused_when_disarmed(key):
+    # Every addition is gated exactly like the rest: gate closed => REFUSED,
+    # and NOTHING reaches the scope.
+    alpaca = _StubAlpaca()
+    result = dispatch(
+        alpaca, key, "ON", controls_enabled=False, allow_power=False)
+    assert result.status is DispatchStatus.REFUSED
+    assert alpaca.calls == []
+
+
+@pytest.mark.parametrize("key", _NEW_CONTROL_KEYS)
+def test_new_controls_are_not_power_gated(key):
+    # None of these is destructive, so none needs the second (power) gate.
+    assert _control(key).power_gated is False
+
+
 def test_startup_is_power_gated():
     assert _control("startup").power_gated is True
 
@@ -593,6 +696,30 @@ def test_control_entities_do_not_collide_with_phase1_entities():
     phase1_keys = {entity.key for entity in ENTITIES}
     control_keys = {entry.key for entry in CONTROL_ENTITIES}
     assert phase1_keys.isdisjoint(control_keys)
+
+
+def test_control_entities_cover_exactly_the_dispatch_stored_and_safety_keys():
+    # Lock-step between the two catalogs: every dispatchable control, stored
+    # input, and safety switch has exactly one discovery entity — no orphaned
+    # entity (a command topic nobody handles) and no undiscoverable control.
+    entity_keys = {entry.key for entry in CONTROL_ENTITIES}
+    expected = ({ctl.key for ctl in control.CONTROLS}
+                | {si.key for si in control.STORED_INPUTS}
+                | {"controls_enabled", "allow_power"})
+    assert entity_keys == expected, entity_keys.symmetric_difference(expected)
+
+
+def test_control_entity_component_name_and_range_match_the_dispatch_catalog():
+    # The discovery entity must present each control as what it dispatches:
+    # same component, same operator-facing name, same number range.
+    by_key = {entry.key: entry for entry in CONTROL_ENTITIES}
+    for ctl in control.CONTROLS:
+        entity = by_key[ctl.key]
+        assert entity.component == ctl.component, ctl.key
+        assert entity.name == ctl.name, ctl.key
+        assert entity.min_value == ctl.min_value, ctl.key
+        assert entity.max_value == ctl.max_value, ctl.key
+        assert entity.step == ctl.step, ctl.key
 
 
 @pytest.mark.parametrize("safety_key", ["controls_enabled", "allow_power"])

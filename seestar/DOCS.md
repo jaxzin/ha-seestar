@@ -153,9 +153,14 @@ another.
 | **Goto** (button) | Slews to the stored RA/Dec, labelled with the stored target name. | **Refuses without parseable, in-range coordinates** — it never guesses where a name is. |
 | **Stop goto** (button) | Aborts an in-progress goto. | |
 | **Stack exposure** (number) | Sets the stacking exposure **in milliseconds** (1–60000). | ms end-to-end: solar work is ~1–5 ms; deep-sky stacking is tens of seconds (`10000`, `30000`). |
+| **Gain** (number) | Sets the camera ISP gain (0–300). | The same `set_setting` call seestar_alp's own web UI makes. |
 | **Focus** (number) | Nudges the focuser by a relative number of steps (−500…500). | |
+| **Auto-focus** (button) | Runs the scope's auto-focus routine. | |
 | **Mag declination** (number) | Magnetic-declination fudge angle for the compass calibration (±180°). | |
+| **Tracking** (switch) | Turns mount tracking on or off. | |
 | **Dew heater** (switch) | Turns the dew heater on or off. | ON applies a fixed power level of 90 (scale 0–100). |
+| **Wide camera** (switch) | Enables/disables the wide-angle camera. | S30-series only; upstream marks the setting experimental — see [Rough edges](#rough-edges). |
+| **Record video** (switch) | Starts/stops planetary video recording. | Only records during a planetary live session — see [Rough edges](#rough-edges). |
 | **Plate-solve loop** (switch) | Starts/stops the polar-align plate-solve loop. | ON is a no-op on firmware > 2.47 — see [Rough edges](#rough-edges). |
 | **Run plan** (text) | Runs a saved plan **by name**: imports it, then starts the scheduler. | The name resolves under seestar_alp's own `schedule/` directory (where its SSC web UI saves plans); `.json` is appended if omitted. **No paths** — a name containing `/`, `\`, `..`, or starting with `~`/`.` is refused. |
 | **Pause plan** (button) | Pauses the running plan. | |
@@ -170,7 +175,8 @@ another.
 
 The **Live view** camera shows seestar_alp's real-time `/vid` stacking stream —
 but **only while the imaging session was started from Home Assistant** (via
-*Start live view*, *Start stacking*, or *Run plan*). The scope's firmware serves
+*Start live view*, *Start stacking*, *Goto*, *Run plan*, *Start mosaic*, or
+*Start spectra*). The scope's firmware serves
 live frames only to the session's **owning client**; when this bridge starts the
 session, it is that owner. A session started from the phone app belongs to the
 phone, so the camera reads **unavailable** and you get only the saved-stack
@@ -180,8 +186,11 @@ independently either way.
 
 ### Rough edges
 
-Per the Phase-2 "expose everything" directive, the full control surface is
-published even where it is rough. Known edges, verified against seestar_alp:
+Per the Phase-2 "expose everything" directive, every control with a clean
+seestar_alp path is published even where it is rough; anything deliberately
+left out is listed under
+[Deliberate omissions](#deliberate-omissions) below. Known edges, verified
+against seestar_alp:
 
 - **Stop only stops scheduler-driven sessions.** The *Stop* button maps to
   seestar_alp's `stop_scheduler`, so a live view or stack started outside the
@@ -189,12 +198,31 @@ published even where it is rough. Known edges, verified against seestar_alp:
 - **Plate-solve loop ON is a no-op on firmware newer than 2.47.** seestar_alp
   answers `start_plate_solve_loop` with a "Deprecated" warning and does nothing;
   turning the switch OFF still calls `stop_plate_solve_loop`.
+- **Wide camera is S30-series only.** The `wide_cam` setting exists on the
+  S30/S30 Pro; seestar_alp's own web UI additionally hides the toggle behind an
+  experimental flag. Other models refuse or ignore it.
+- **Record video only records during a planetary live session.** Outside one,
+  the scope refuses `start_record_avi` in-band and the refusal shows as
+  `error: …` on **Last command result**.
 - **In-band scope refusals surface via Last command result.** seestar_alp
   reports many refusals as an HTTP 200 with an error body (e.g. importing a
   plan while a scheduler is already active, or running the startup sequence
   while busy). The bridge detects that shape and publishes it as `error: …` on
   the **Last command result** sensor — the command reached the driver, but the
   scope said no.
+- **Restarting the app mid-session turns the Live view camera off.** Session
+  ownership lives in the bridge's memory, so an app restart during an
+  HA-started session forgets that HA owns it: telemetry and the saved-stack
+  preview keep working, but the **Live view** camera stays unavailable until
+  the **next** session started from Home Assistant.
+
+### Deliberate omissions
+
+- **Capture photo.** There is no clean seestar_alp path to map a button to:
+  the upstream `live/photo` route is an unimplemented placeholder
+  (`LivePhotoResource` in seestar_alp's front server does nothing). Rather
+  than bolt a new HTTP surface onto the bridge, the control is omitted until
+  upstream implements it.
 
 ## Running without the Supervisor
 

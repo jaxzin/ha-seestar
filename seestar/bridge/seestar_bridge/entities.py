@@ -289,6 +289,11 @@ _EXPOSURE_MIN_MS = 1
 _EXPOSURE_MAX_MS = 60_000
 _EXPOSURE_UNIT = "ms"
 
+# ISP gain bounds — must mirror control.GAIN_MIN/MAX (asserted consistent by the
+# control tests): the range seestar_alp's own web UI enforces before set_setting.
+_GAIN_MIN = 0
+_GAIN_MAX = 300
+
 # The command catalog. Per the Phase-2 spec's "expose everything" directive, this
 # covers Session/imaging, Plans execution, and Power/position, PLUS the two
 # first-class safety switches. Param-carrying discrete actions pair VALUE-ONLY
@@ -327,14 +332,25 @@ CONTROL_ENTITIES: list[ControlEntity] = [
     ControlEntity(_COMPONENT_NUMBER, "exposure", "Stack exposure",
                   "mdi:camera-timer", min_value=_EXPOSURE_MIN_MS,
                   max_value=_EXPOSURE_MAX_MS, step=1, unit=_EXPOSURE_UNIT),
+    ControlEntity(_COMPONENT_NUMBER, "gain", "Gain", "mdi:brightness-6",
+                  min_value=_GAIN_MIN, max_value=_GAIN_MAX, step=1),
     ControlEntity(_COMPONENT_NUMBER, "focus", "Focus", "mdi:focus-field",
                   min_value=-500, max_value=500, step=1),
+    ControlEntity(_COMPONENT_BUTTON, "auto_focus", "Auto-focus",
+                  "mdi:focus-auto"),
     ControlEntity(_COMPONENT_NUMBER, "mag_declination", "Mag declination",
                   "mdi:compass", min_value=-180, max_value=180, step=0.1),
+    # Keyed distinctly from the Phase-1 read-only ``tracking`` binary_sensor so
+    # the command switch's unique_id/topic never collides with the sensor's.
+    ControlEntity(_COMPONENT_SWITCH, "tracking_set", "Tracking", "mdi:target"),
     # Keyed distinctly from the Phase-1 read-only ``dew_heater`` binary_sensor so
     # the command switch's unique_id/topic never collides with the sensor's.
     ControlEntity(_COMPONENT_SWITCH, "dew_heater_set", "Dew heater",
                   "mdi:heating-coil"),
+    ControlEntity(_COMPONENT_SWITCH, "wide_cam", "Wide camera",
+                  "mdi:camera-switch-outline"),
+    ControlEntity(_COMPONENT_SWITCH, "record_video", "Record video",
+                  "mdi:record-rec"),
     ControlEntity(_COMPONENT_SWITCH, "plate_solve_loop", "Plate-solve loop",
                   "mdi:image-filter-center-focus"),
     # -- Plans (execution only) --

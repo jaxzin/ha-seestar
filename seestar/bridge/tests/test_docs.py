@@ -76,6 +76,13 @@ def test_documented_exposure_range_matches_catalog():
     assert expected in _docs_text()
 
 
+def test_documented_gain_range_matches_catalog():
+    # The Controls table documents 'Gain' with the catalog's exact bounds
+    # (an en-dash range, e.g. ``0–300``), not hand-copied numbers.
+    expected = f"{control.GAIN_MIN}–{control.GAIN_MAX}"
+    assert expected in _docs_text()
+
+
 def test_documented_imaging_modes_match_catalog():
     text = _docs_text()
     imaging_mode = next(

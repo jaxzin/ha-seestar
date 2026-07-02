@@ -61,6 +61,24 @@ _METHOD_SCOPE_PARK = "scope_park"
 #: Powers off the WHOLE device (seestar_device.shut_down_thread: park, then
 #: shut down the Pi). Only the ``shutdown`` control may ever send this.
 _METHOD_PI_SHUTDOWN = "pi_shutdown"
+#: The generic settings RPC the SSC web UI itself uses for gain
+#: (front/app.py LiveGainResource: ``set_setting {"isp_gain": <0..300>}``) and
+#: the wide-angle camera (LiveWideCamResource: ``set_setting {"wide_cam": bool}``).
+_METHOD_SET_SETTING = "set_setting"
+#: Mount tracking on/off. Verified wire shape: params is a BARE BOOL —
+#: seestar_alp's own Bruno API collection sends
+#: ``{"method":"scope_set_track_state", "params":true}`` and its bundled CLI
+#: client does the same (cli/ssalp_api_client/commands/mount.py).
+_METHOD_SET_TRACK_STATE = "scope_set_track_state"
+#: Auto-focus. The upstream firmware RPC really is spelled ``start_auto_focuse``
+#: (sic) — verified in seestar_alp device/seestar_device.py:_start_auto_focus
+#: and front/app.py's start_auto_focus route, both of which send exactly this.
+_METHOD_START_AUTO_FOCUS = "start_auto_focuse"
+#: Planetary AVI/MP4 recording, as the SSC web UI's live/video route drives it
+#: (front/app.py LiveVideoResource: method_sync start_record_avi with a
+#: ``{"raw": bool}`` params dict, method_sync stop_record_avi with none).
+_METHOD_START_RECORD_AVI = "start_record_avi"
+_METHOD_STOP_RECORD_AVI = "stop_record_avi"
 
 # -- imaging modes fed to iscope_start_view (spec's Imaging mode select) ---------
 _IMAGING_MODES = ("star", "scenery", "planet", "sun", "moon")
@@ -122,6 +140,12 @@ _PARENT_DIR = ".."
 #    seconds, so the range spans 1 ms .. 60 s with the value passed through. -----
 EXPOSURE_MIN_MS = 1
 EXPOSURE_MAX_MS = 60_000
+
+# -- gain: the ISP gain range the SSC web UI itself enforces (front/app.py
+#    LiveGainResource accepts 0 <= gain <= 300 before set_setting). Mirrored by
+#    entities.CONTROL_ENTITIES and the DOCS lock-step test. ----------------------
+GAIN_MIN = 0
+GAIN_MAX = 300
 
 # A single dispatched action as it goes on the wire: the /action name plus the
 # Parameters dict the bridge JSON-encodes. A control may emit more than one (e.g.
@@ -364,6 +388,43 @@ def _dew_heater(payload: Any) -> Sequence[Call]:
     return [("action_set_dew_heater", {"heater": value})]
 
 
+def _gain(payload: Any) -> Sequence[Call]:
+    """Set the ISP gain, exactly as the SSC web UI's live/gain route does."""
+    return [(_METHOD_SYNC, {"method": _METHOD_SET_SETTING,
+                            "params": {"isp_gain": _as_number(payload)}})]
+
+
+def _tracking(payload: Any) -> Sequence[Call]:
+    """Turn mount tracking on/off (scope_set_track_state, bare-bool params)."""
+    return [(_METHOD_SYNC, {"method": _METHOD_SET_TRACK_STATE,
+                            "params": _switch_is_on(payload)})]
+
+
+def _wide_cam(payload: Any) -> Sequence[Call]:
+    """Enable/disable the wide-angle camera (S30-series), via set_setting."""
+    return [(_METHOD_SYNC, {"method": _METHOD_SET_SETTING,
+                            "params": {"wide_cam": _switch_is_on(payload)}})]
+
+
+def _auto_focus(_payload: Any) -> Sequence[Call]:
+    """Run the auto-focus routine (upstream RPC spelled start_auto_focuse)."""
+    return [(_METHOD_SYNC, {"method": _METHOD_START_AUTO_FOCUS})]
+
+
+def _record_video(payload: Any) -> Sequence[Call]:
+    """Start/stop planetary AVI recording, as the SSC live/video route does.
+
+    ON starts a plain (non-raw, non-timelapse) recording — the web UI's own
+    default form post; OFF stops it. Only meaningful during a planetary live
+    session; outside one the firmware refuses in-band, which surfaces as an
+    ERROR dispatch result on the command-result sensor.
+    """
+    if _switch_is_on(payload):
+        return [(_METHOD_SYNC, {"method": _METHOD_START_RECORD_AVI,
+                                "params": {"raw": False}})]
+    return [(_METHOD_SYNC, {"method": _METHOD_STOP_RECORD_AVI})]
+
+
 def _plate_solve_loop(payload: Any) -> Sequence[Call]:
     """Start or stop the polar-align plate-solve loop from a switch."""
     action = "start_plate_solve_loop" if _switch_is_on(payload) else "stop_plate_solve_loop"
@@ -417,6 +478,10 @@ def _as_number(payload: Any) -> float | int:
 # - 'Plate-solve loop' ON is a firmware > 2.47 no-op: seestar_alp answers
 #   start_plate_solve_loop with a "Deprecated" warning and does nothing (OFF
 #   still calls stop_plate_solve_loop).
+# - 'Wide camera' is S30-series only (upstream's own UI additionally hides it
+#   behind Config.experimental); other models refuse/ignore the setting.
+# - 'Record video' only records during a planetary live session (the firmware
+#   refuses start_record_avi otherwise, in-band -> an ERROR dispatch result).
 # - seestar_alp reports many refusals IN-BAND: HTTP 200 with a json_result body
 #   of ``{"code": -1, "result": "..."}`` (e.g. import_schedule while a scheduler
 #   is active, action_start_up_sequence while busy). Alpaca.action detects that
@@ -448,13 +513,24 @@ CONTROLS: list[Control] = [
     # Exposure is MILLISECONDS end-to-end (action_set_exposure's ``exp`` is ms).
     Control("exposure", COMPONENT_NUMBER, "Stack exposure", _exposure,
             min_value=EXPOSURE_MIN_MS, max_value=EXPOSURE_MAX_MS, step=1),
+    # Gain mirrors the SSC web UI's own live/gain route: set_setting isp_gain,
+    # range-checked to the UI's 0..300.
+    Control("gain", COMPONENT_NUMBER, "Gain", _gain,
+            min_value=GAIN_MIN, max_value=GAIN_MAX, step=1),
     Control("focus", COMPONENT_NUMBER, "Focus", _focus,
             min_value=-500, max_value=500, step=1),
+    Control("auto_focus", COMPONENT_BUTTON, "Auto-focus", _auto_focus),
     Control("mag_declination", COMPONENT_NUMBER, "Mag declination",
             _mag_declination, min_value=-180, max_value=180, step=0.1),
+    # Keyed distinctly from the Phase-1 read-only ``tracking`` binary_sensor so
+    # the command switch's unique_id never collides with the sensor's (the same
+    # convention as dew_heater_set below).
+    Control("tracking_set", COMPONENT_SWITCH, "Tracking", _tracking),
     # Keyed distinctly from the Phase-1 read-only ``dew_heater`` binary_sensor so
     # the command switch's unique_id never collides with the sensor's.
     Control("dew_heater_set", COMPONENT_SWITCH, "Dew heater", _dew_heater),
+    Control("wide_cam", COMPONENT_SWITCH, "Wide camera", _wide_cam),
+    Control("record_video", COMPONENT_SWITCH, "Record video", _record_video),
     Control("plate_solve_loop", COMPONENT_SWITCH, "Plate-solve loop",
             _plate_solve_loop),
     # -- Plans (execution only) --
