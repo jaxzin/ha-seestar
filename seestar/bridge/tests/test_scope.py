@@ -12,6 +12,7 @@ import json
 import struct
 import sys
 import threading
+import warnings
 import zlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -464,6 +465,36 @@ def test_decode_preview_swallows_decompression_bomb():
     with pytest.raises(image.DecompressionBombError):
         image.open(io.BytesIO(bomb)).load()
     assert _preview_worker("http://stub")._decode_preview(bomb) is None
+
+
+def test_decode_preview_rejects_pixel_count_over_the_explicit_cap(monkeypatch):
+    # MINOR: the ceiling is EXPLICIT at the cap. Pillow's own
+    # DecompressionBombError only fires above 2x MAX_IMAGE_PIXELS (it merely
+    # warns between 1x and 2x), so with the cap patched below the image's pixel
+    # count — but the 2x threshold above it — only the explicit width*height
+    # check can be doing the rejecting.
+    pil = pytest.importorskip("PIL.Image")
+    # _decode_preview writes the (patched) cap into the PIL module-global;
+    # re-setting the current value via monkeypatch restores it on teardown.
+    monkeypatch.setattr(pil, "MAX_IMAGE_PIXELS", pil.MAX_IMAGE_PIXELS)
+    buf = io.BytesIO()
+    pil.new("RGB", (8, 8), "white").save(buf, format="JPEG")  # 64 pixels
+    monkeypatch.setattr("seestar_bridge.scope._MAX_IMAGE_PIXELS", 40)  # 40 < 64 < 80
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # Pillow's bomb WARNING (1x..2x band)
+        assert _preview_worker("http://stub")._decode_preview(buf.getvalue()) is None
+
+
+def test_decode_preview_accepts_pixel_count_at_or_under_the_cap(monkeypatch):
+    # The same image passes when the cap covers it: the explicit check is a
+    # ceiling, not a blanket rejection.
+    pil = pytest.importorskip("PIL.Image")
+    monkeypatch.setattr(pil, "MAX_IMAGE_PIXELS", pil.MAX_IMAGE_PIXELS)
+    buf = io.BytesIO()
+    pil.new("RGB", (8, 8), "white").save(buf, format="JPEG")  # 64 pixels
+    monkeypatch.setattr("seestar_bridge.scope._MAX_IMAGE_PIXELS", 64)
+    out = _preview_worker("http://stub")._decode_preview(buf.getvalue())
+    assert out is not None and out[:2] == b"\xff\xd8"
 
 
 def test_fetch_preview_swallows_garbage_after_magic():

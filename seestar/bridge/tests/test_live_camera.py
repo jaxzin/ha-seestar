@@ -25,7 +25,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from seestar_bridge import control
+from seestar_bridge import scope as scope_mod
 from seestar_bridge.scope import (
+    _MAX_POLLS_WITHOUT_VIEW,
     _SESSION_END_KEYS,
     _SESSION_START_KEYS,
     ScopeWorker,
@@ -189,8 +191,21 @@ class _StopAfterOneCycle(Exception):
 
 def _run_one_cycle(worker, monkeypatch):
     """Drive ``worker.run()`` through exactly one poll cycle, then stop."""
+    _run_cycles(worker, monkeypatch, 1)
+
+
+def _run_cycles(worker, monkeypatch, count):
+    """Drive ``worker.run()`` through exactly ``count`` poll cycles, then stop.
+
+    The stop is raised from the inter-cycle ``time.sleep`` — OUTSIDE the run
+    loop's unkillable-cycle catch-all — so it still terminates the loop.
+    """
+    remaining = {"cycles": count}
+
     def _stop(_seconds):
-        raise _StopAfterOneCycle
+        remaining["cycles"] -= 1
+        if remaining["cycles"] <= 0:
+            raise _StopAfterOneCycle
 
     monkeypatch.setattr("seestar_bridge.scope.time.sleep", _stop)
     with pytest.raises(_StopAfterOneCycle):
@@ -322,6 +337,10 @@ def test_session_start_ok_flips_ownership_and_poll_publishes_frame(monkeypatch):
 def test_every_session_start_key_flips_ownership(start_key):
     worker = _worker(_closed_port())
     _arm(worker)
+    # goto dispatches from the stored coordinate inputs; seed them so its
+    # dispatch is OK (a refused goto must not — and does not — flip ownership).
+    worker.handle_command(_cmd_topic("goto_ra"), "5.591")
+    worker.handle_command(_cmd_topic("goto_dec"), "-5.39")
     # run_plan is a text control (a plan name); buttons take PRESS.
     payload = "tonight" if start_key == "run_plan" else "PRESS"
     worker.handle_command(_cmd_topic(start_key), payload)
@@ -357,27 +376,85 @@ def test_every_session_end_key_clears_ownership(end_key):
     assert worker.session_owned is False
 
 
-def test_view_ended_event_clears_ownership_before_any_grab(monkeypatch):
+def test_view_ended_event_clears_confirmed_ownership_before_any_grab(monkeypatch):
     # Ownership confirmation: the poll refreshes the flag from the non-blocking
-    # get_event_state View state. An explicitly ended View (seestar_alp's own
-    # terminal states) clears ownership BEFORE the grab, so the imaging port is
-    # not polled for a session that no longer exists.
+    # get_event_state View state. Once the session has been observed active
+    # ('working'), an explicitly ended View (seestar_alp's own terminal states)
+    # clears ownership BEFORE the grab, so the imaging port is not polled for a
+    # session that no longer exists.
+    stub = _ImagingStub(_stream(_part("image/jpeg", _tiny_jpeg())))
+    try:
+        worker = _worker(stub.port)  # EVENT_VIEW_WORKING: session active
+        _start_session(worker)
+        _run_one_cycle(worker, monkeypatch)  # observes 'working' -> confirmed
+        assert stub.request_count() == 1
+
+        worker._alpaca.event_state = {"View": {"state": "cancel"}}
+        _run_one_cycle(worker, monkeypatch)
+    finally:
+        stub.shutdown()
+    assert worker.session_owned is False
+    assert stub.request_count() == 1  # the post-cancel cycle never polled
+    assert worker._mqtt.payloads(worker.live_availability_topic)[-1] == "offline"
+
+
+def test_stale_terminal_view_after_session_start_is_ignored(monkeypatch):
+    # MAJOR: get_event_state retains the LAST View of any PREVIOUS session, so
+    # right after a session-start dispatch a stale 'cancel'/'complete' must NOT
+    # clear the just-granted ownership — only a session that has been observed
+    # active at least once may be terminal-cleared.
     stub = _ImagingStub(_stream(_part("image/jpeg", _tiny_jpeg())))
     try:
         worker = _worker(stub.port, event_state={"View": {"state": "cancel"}})
         _start_session(worker)
         _run_one_cycle(worker, monkeypatch)
+        assert worker.session_owned is True  # the stale terminal was ignored
+        assert stub.request_count() == 1     # and the grab proceeded
+
+        # The new session reports active: ownership is now confirmed...
+        worker._alpaca.event_state = {"View": {"state": "working"}}
+        _run_one_cycle(worker, monkeypatch)
+        assert worker.session_owned is True
+
+        # ...so a LATER terminal View (scheduler not working) clears it.
+        worker._alpaca.event_state = {"View": {"state": "complete"}}
+        _run_one_cycle(worker, monkeypatch)
     finally:
         stub.shutdown()
     assert worker.session_owned is False
-    assert stub.request_count() == 0
-    assert worker._mqtt.payloads(worker.live_availability_topic)[-1] == "offline"
+    assert stub.request_count() == 2  # the cleared cycle never polled
+
+
+def test_plan_view_terminal_between_targets_keeps_ownership(monkeypatch):
+    # MAJOR: a scheduler-driven plan passes View through terminal states BETWEEN
+    # targets. While the SAME get_event_state snapshot reports the scheduler
+    # 'working', a terminal View must NOT kill the live camera mid-plan; once
+    # the scheduler stops AND the View is terminal, ownership clears.
+    stub = _ImagingStub(_stream(_part("image/jpeg", _tiny_jpeg())))
+    try:
+        worker = _worker(stub.port, event_state={
+            "View": {"state": "complete"}, "scheduler": {"state": "working"}})
+        _arm(worker)
+        worker.handle_command(_cmd_topic("run_plan"), "tonight")
+        assert worker.session_owned is True
+
+        _run_one_cycle(worker, monkeypatch)  # between targets
+        assert worker.session_owned is True
+        assert stub.request_count() == 1     # live camera stayed on
+
+        worker._alpaca.event_state = {
+            "View": {"state": "complete"}, "scheduler": {"state": "stopped"}}
+        _run_one_cycle(worker, monkeypatch)  # plan over
+    finally:
+        stub.shutdown()
+    assert worker.session_owned is False
+    assert stub.request_count() == 1  # the post-plan cycle never polled
 
 
 def test_absent_view_event_keeps_ownership(monkeypatch):
     # A partial event with no View block carries no information about the
-    # session; it must NOT clear ownership (only an explicit terminal state or
-    # a stop-class command does).
+    # session; it must NOT clear ownership (only an explicit terminal state, a
+    # stop-class command, or the sustained-absence staleness bound does).
     stub = _ImagingStub(_stream(_part("image/jpeg", _tiny_jpeg())))
     try:
         worker = _worker(stub.port, event_state={"PiStatus": {"temp": 20.0}})
@@ -387,6 +464,48 @@ def test_absent_view_event_keeps_ownership(monkeypatch):
         stub.shutdown()
     assert worker.session_owned is True
     assert stub.request_count() == 1
+
+
+# -- stuck-ownership staleness bound -------------------------------------------
+
+#: A successful event poll with NO View block at all (driver restart wipes
+#: event_state; an owned session always has a View).
+_NO_VIEW_SNAPSHOT = {"PiStatus": {"temp": 20.0}}
+
+
+def test_sustained_absence_of_view_clears_stuck_ownership():
+    # MINOR: after _MAX_POLLS_WITHOUT_VIEW consecutive successful polls with no
+    # View block at all, ownership is stale (the driver restarted out from
+    # under us) and must clear — otherwise the imaging port is polled forever.
+    worker = _worker(_closed_port())
+    _start_session(worker)
+    for _ in range(_MAX_POLLS_WITHOUT_VIEW - 1):
+        worker._refresh_session_ownership(_NO_VIEW_SNAPSHOT)
+    assert worker.session_owned is True  # one short of the bound: still owned
+    worker._refresh_session_ownership(_NO_VIEW_SNAPSHOT)
+    assert worker.session_owned is False
+
+
+def test_view_presence_resets_the_no_view_staleness_counter():
+    # The bound is CONSECUTIVE absences: any View block in between restarts it.
+    worker = _worker(_closed_port())
+    _start_session(worker)
+    for _ in range(_MAX_POLLS_WITHOUT_VIEW - 1):
+        worker._refresh_session_ownership(_NO_VIEW_SNAPSHOT)
+    worker._refresh_session_ownership(EVENT_VIEW_WORKING)  # View seen: reset
+    for _ in range(_MAX_POLLS_WITHOUT_VIEW - 1):
+        worker._refresh_session_ownership(_NO_VIEW_SNAPSHOT)
+    assert worker.session_owned is True
+
+
+def test_no_view_polls_with_working_scheduler_do_not_count_as_stale():
+    # A working scheduler is itself evidence the session lives (e.g. a plan
+    # item that has not opened a View yet); those polls never count as stale.
+    worker = _worker(_closed_port())
+    _start_session(worker)
+    for _ in range(_MAX_POLLS_WITHOUT_VIEW + 1):
+        worker._refresh_session_ownership({"scheduler": {"state": "working"}})
+    assert worker.session_owned is True
 
 
 # -- (d) malformed / oversized stream parts ----------------------------------------
@@ -440,6 +559,121 @@ def test_grab_failure_marks_cycle_unavailable_but_telemetry_unaffected(monkeypat
     assert worker._mqtt.payloads(worker.availability_topic)[-1] == "online"
     state = json.loads(worker._mqtt.payloads(worker.state_topic)[-1])
     assert state["telephoto_target"] == "M31"  # telemetry untouched
+
+
+class _TruncatingImagingStub:
+    """Imaging stub whose chunked reply is truncated mid-part.
+
+    It promises another chunk after the first, then hangs up: on the client
+    side ``resp.read()`` raises ``http.client.IncompleteRead`` — an
+    ``HTTPException``, NOT an ``OSError`` — which is exactly the exception
+    class that used to escape ``_PROBE_ERRORS`` and kill the worker thread.
+    """
+
+    def __init__(self):
+        stub = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"  # required for chunked encoding
+
+            def do_GET(self):
+                with stub._lock:
+                    stub.requests.append(self.path)
+                self.send_response(200)
+                self.send_header(
+                    "Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                part = _BOUNDARY + b"Content-Type: image/jpeg\r\n\r\n\xff\xd8"
+                self.wfile.write(f"{len(part):x}\r\n".encode() + part + b"\r\n")
+                # Promise a 0x400-byte chunk, then close without sending it.
+                self.wfile.write(b"400\r\n")
+                self.close_connection = True
+
+            def log_message(self, *args):
+                pass
+
+        self.requests: list[str] = []
+        self._lock = threading.Lock()
+        self._server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    @property
+    def port(self) -> int:
+        return self._server.server_address[1]
+
+    def request_count(self) -> int:
+        with self._lock:
+            return len(self.requests)
+
+    def shutdown(self):
+        self._server.shutdown()
+
+
+def test_truncated_chunked_stream_does_not_kill_the_worker_loop(monkeypatch):
+    # MAJOR: IncompleteRead (http.client.HTTPException, not an OSError) from a
+    # truncated reply must degrade to live-offline-this-cycle — the NEXT cycle
+    # still runs and polls again, proving the worker thread survived.
+    stub = _TruncatingImagingStub()
+    try:
+        worker = _worker(stub.port)
+        _start_session(worker)
+        _run_cycles(worker, monkeypatch, 2)
+    finally:
+        stub.shutdown()
+    assert stub.request_count() == 2  # cycle 2 ran: the loop survived cycle 1
+    assert worker.session_owned is True  # a transport error is not a lost session
+    assert worker._mqtt.payloads(worker.live_availability_topic)[-1] == "offline"
+    # Telemetry kept publishing on both cycles.
+    assert len(worker._mqtt.payloads(worker.state_topic)) == 2
+
+
+def test_incomplete_read_is_a_probe_error():
+    # The wiring guard for the fix: IncompleteRead is an HTTPException and NOT
+    # an OSError, and _PROBE_ERRORS must cover it.
+    import http.client
+
+    assert not issubclass(http.client.IncompleteRead, OSError)
+    assert issubclass(http.client.HTTPException, scope_mod._PROBE_ERRORS)
+
+
+class _ExplodingAlpaca(_LiveAlpaca):
+    """Alpaca stand-in whose ``is_connected`` raises an arbitrary non-probe
+    exception on the FIRST call only — an exception class no targeted handler
+    in the cycle expects, so only the run loop's catch-all can absorb it."""
+
+    def __init__(self, event_state):
+        super().__init__(event_state)
+        self.connected_calls = 0
+
+    def is_connected(self, timeout=None):
+        self.connected_calls += 1
+        if self.connected_calls == 1:
+            raise ZeroDivisionError("unexpected cycle bug")
+        return True
+
+
+def test_unexpected_cycle_exception_publishes_offline_and_loop_continues(monkeypatch):
+    # MAJOR: the run loop is UNKILLABLE by any single cycle's exception: the
+    # failure is logged, the scope + live camera read offline for that cycle,
+    # and the next cycle runs normally.
+    alpaca = _ExplodingAlpaca(EVENT_VIEW_WORKING)
+    worker = ScopeWorker(
+        alpaca=alpaca,
+        device=DEVICE,
+        settings=_settings(_closed_port()),
+        mqtt_client=_FakeMqtt(),
+        scope_http_base=None,
+        bridge_availability_topic="seestar/bridge/availability",
+    )
+    _run_cycles(worker, monkeypatch, 2)
+    assert alpaca.connected_calls == 2  # cycle 2 ran: the loop survived cycle 1
+    # Cycle 1 published offline (the catch-all), cycle 2 recovered to online.
+    assert worker._mqtt.payloads(worker.availability_topic) == ["offline", "online"]
+    assert worker._mqtt.payloads(worker.live_availability_topic)[0] == "offline"
+    # Cycle 2's telemetry went out as always.
+    state = json.loads(worker._mqtt.payloads(worker.state_topic)[-1])
+    assert state["telephoto_target"] == "M31"
 
 
 def test_grab_returns_none_when_stream_serves_only_the_loading_gif(monkeypatch):
@@ -503,7 +737,7 @@ def test_grab_gives_up_at_the_overall_deadline(monkeypatch):
 
     server = HTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    monkeypatch.setattr("seestar_bridge.scope._PREVIEW_TIMEOUT_SEC", timeout_sec)
+    monkeypatch.setattr("seestar_bridge.scope._LIVE_GRAB_TIMEOUT_SEC", timeout_sec)
     try:
         worker = _worker(server.server_address[1])
         started = time.monotonic()
@@ -511,6 +745,14 @@ def test_grab_gives_up_at_the_overall_deadline(monkeypatch):
         assert time.monotonic() - started < timeout_sec * 10
     finally:
         server.shutdown()
+
+
+def test_live_grab_deadline_is_short_and_named():
+    # MINOR: the live grab runs INLINE in the poll loop, so its deadline is a
+    # short named constant (~5 s) — a frame arrives immediately when frames
+    # exist — while the saved-preview download keeps its longer budget.
+    assert scope_mod._LIVE_GRAB_TIMEOUT_SEC == 5
+    assert scope_mod._LIVE_GRAB_TIMEOUT_SEC < scope_mod._PREVIEW_TIMEOUT_SEC
 
 
 # -- settings: the imaging base derivation ------------------------------------------

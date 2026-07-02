@@ -22,6 +22,7 @@ reachable) + the state JSON each cycle.
 """
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import logging
@@ -51,7 +52,11 @@ _log = logging.getLogger(__name__)
 #: I/O errors a best-effort probe may raise that should degrade gracefully (skip
 #: this field this cycle) rather than abort the worker loop. A timeout from a
 #: busy scope is handled separately, since it drives the backoff.
-_PROBE_ERRORS = (urllib.error.URLError, OSError, ValueError)
+#: ``http.client.HTTPException`` is a MEMBER, not an ``OSError`` subclass: a
+#: truncated chunked reply from the imaging server raises ``IncompleteRead``
+#: (an HTTPException), which previously escaped this tuple and killed the
+#: worker thread permanently.
+_PROBE_ERRORS = (urllib.error.URLError, http.client.HTTPException, OSError, ValueError)
 
 # --- extraction constants (named, not inlined, so the contract is auditable) ---
 
@@ -168,10 +173,16 @@ _STATEFUL_DISPATCH_COMPONENTS = frozenset({
 # session-starting command dispatched OK through the bridge's own command path.
 
 #: Dispatch-catalog keys whose OK dispatch makes seestar_alp (and therefore this
-#: bridge) the owning client: iscope_start_view, start_stack, and the scheduler
-#: run (which itself issues iscope_start_view). Guarded against catalog drift by
+#: bridge) the owning client. Verified against seestar_alp: start_live_view is
+#: iscope_start_view itself; goto_target ISSUES iscope_start_view
+#: (device/seestar_device.py:849-857); start_stack owns the stack;
+#: run_plan/start_mosaic/start_spectra all run start_scheduler, whose plan items
+#: issue iscope_start_view. Guarded against catalog drift by
 #: test_session_tracking_keys_exist_in_dispatch_catalog.
-_SESSION_START_KEYS = frozenset({"start_live_view", "start_stack", "run_plan"})
+_SESSION_START_KEYS = frozenset({
+    "start_live_view", "start_stack", "run_plan",
+    "goto", "start_mosaic", "start_spectra",
+})
 
 #: Dispatch-catalog keys whose OK dispatch ends (or stows/powers off) the
 #: session, clearing ownership.
@@ -185,6 +196,25 @@ _SESSION_END_KEYS = frozenset({"stop", "park", "shutdown"})
 #: ``terminal_states = {"complete", "fail", "cancel"}``).
 _VIEW_ENDED_STATES = frozenset({"complete", "fail", "cancel"})
 
+#: The ``scheduler`` block seestar_alp's get_event_state injects into EVERY
+#: event snapshot (device/seestar_device.py get_event_state: it mirrors
+#: ``self.schedule["state"]``); ``"working"`` is the value while a plan runs
+#: (scheduler_thread_fn sets it; pause only flips is_stacking_paused, the state
+#: stays "working"). A working scheduler routinely passes View through terminal
+#: states BETWEEN plan targets, so View-terminal must never clear ownership
+#: while the scheduler is working.
+_SCHEDULER_EVENT_KEY = "scheduler"
+_SCHEDULER_WORKING_STATE = "working"
+
+#: Stuck-ownership staleness bound: a driver restart wipes its event_state, and
+#: an owned session ALWAYS carries a View block — so this many CONSECUTIVE
+#: successful event polls with no View block at all (and no working scheduler)
+#: means the owned session no longer exists anywhere, and ownership is cleared.
+#: 12 polls is ~2 minutes at the default 10 s cadence: long enough for a slow
+#: session start to emit its first View event, short enough that a restarted
+#: driver doesn't leave the bridge polling the imaging port for long.
+_MAX_POLLS_WITHOUT_VIEW = 12
+
 # --- HTTP + backoff constants --------------------------------------------------
 
 #: The scope writes both a .fit and a viewable .jpg under MyWorks/; we fetch the
@@ -196,6 +226,12 @@ _JPEG_END_MAGIC = b"\xff\xd9"
 
 _PREVIEW_TIMEOUT_SEC = 30
 _JPEG_QUALITY = 85
+
+#: Deadline for ONE live-stream grab, deliberately much shorter than the
+#: saved-preview fetch: when frames exist the imaging server serves one
+#: immediately, so waiting longer only stalls the poll loop (the grab runs
+#: inline in the per-cycle cadence, unlike the occasional preview download).
+_LIVE_GRAB_TIMEOUT_SEC = 5
 
 #: Live MJPEG stream constants (Phase-1 validated ``grab_preview`` parser). The
 #: stream lives at ``/<device_num>/vid`` on the imaging port; parts are
@@ -312,7 +348,15 @@ class ScopeWorker:
         # Written by paho's command thread (_track_session_ownership) and by the
         # poll thread (_refresh_session_ownership), read by the poll thread every
         # cycle — so all access goes through the lock, never the bare attribute.
+        # ``_session_confirmed`` makes the View-terminal check EDGE-TRIGGERED:
+        # get_event_state retains the LAST View from any PREVIOUS session, so a
+        # stale terminal state right after a session-start dispatch must be
+        # ignored until THIS session has been observed active at least once.
+        # ``_polls_without_view`` drives the staleness bound (see
+        # _MAX_POLLS_WITHOUT_VIEW).
         self._session_owned = False
+        self._session_confirmed = False
+        self._polls_without_view = 0
         self._session_lock = threading.Lock()
         # Value-only stored inputs (imaging mode; goto target/RA/Dec): updated by
         # their command topics WITHOUT any Alpaca call, consumed by the trigger
@@ -813,11 +857,18 @@ class ScopeWorker:
         """Flip the ownership flag under the lock, logging every transition.
 
         Ownership decides whether the imaging port is polled at all, so a
-        transition is operationally significant and never silent.
+        transition is operationally significant and never silent. EVERY write
+        resets the confirmed flag and the no-View counter: a newly started
+        session begins UNCONFIRMED (a stale terminal View from a previous
+        session must not clear it before it first reports active), and a
+        re-issued session start (e.g. a goto mid-session) restarts that
+        edge-trigger for the new View sequence.
         """
         with self._session_lock:
             changed = self._session_owned != owned
             self._session_owned = owned
+            self._session_confirmed = False
+            self._polls_without_view = 0
         if changed:
             _log.info("%s: session ownership -> %s (%s)",
                       self._device_id, "owned" if owned else "not owned", reason)
@@ -825,10 +876,11 @@ class ScopeWorker:
     def _track_session_ownership(self, key: str) -> None:
         """Update ownership from one OK dispatch (called on paho's thread).
 
-        A session-starting command (start_live_view / start_stack / run_plan)
-        dispatched OK makes seestar_alp — and therefore this bridge — the
-        owning client of the ``/vid`` stream; a stop-class command (stop /
-        park / shutdown) ends that. Every other control leaves the flag alone.
+        A session-starting command (start_live_view / start_stack / goto /
+        run_plan / start_mosaic / start_spectra) dispatched OK makes
+        seestar_alp — and therefore this bridge — the owning client of the
+        ``/vid`` stream; a stop-class command (stop / park / shutdown) ends
+        that. Every other control leaves the flag alone.
         """
         if key in _SESSION_START_KEYS:
             self._set_session_owned(True, reason=f"{key} dispatched ok")
@@ -838,17 +890,57 @@ class ScopeWorker:
     def _refresh_session_ownership(self, event_state: Any) -> None:
         """Confirm ownership against the event tap (called on the poll thread).
 
-        Uses the ``View`` state from the non-blocking ``get_event_state`` the
-        loop already polls every cycle (rather than an extra ``get_video_status``
-        RPC): a View in one of seestar_alp's own terminal states means the
-        session ended out from under us (phone app stop, plan completion,
-        failure), so ownership is dropped — the confirmation failed. An absent
-        View block carries no information and keeps the current flag.
+        Uses the same non-blocking ``get_event_state`` snapshot the loop already
+        polls every cycle (no extra RPC). The rules, in order:
+
+        - **Scheduler working keeps ownership.** A scheduler-driven plan
+          routinely passes View through terminal states BETWEEN targets, so
+          while ``event_state['scheduler']['state'] == 'working'`` (the block
+          get_event_state itself injects) a View terminal state is between-
+          targets noise, not a session end. It also CONFIRMS the session.
+        - **An active (non-terminal) View confirms the session.** Only a
+          confirmed session may be terminal-cleared: get_event_state retains
+          the LAST View of any PREVIOUS session, so a stale ``cancel``/
+          ``complete`` observed right after a session-start dispatch — before
+          the new session ever reports active — is ignored.
+        - **A View in a terminal state clears a confirmed session.** The
+          session ended out from under us (phone app stop, plan completion,
+          failure) — seestar_alp's own terminal states.
+        - **Sustained absence of any View block clears ownership.** A driver
+          restart wipes event_state while an owned session always carries a
+          View, so :data:`_MAX_POLLS_WITHOUT_VIEW` consecutive successful polls
+          with no View (and no working scheduler) is stale ownership. A single
+          absence carries no information and keeps the flag.
         """
         if not self.session_owned:
             return
-        view_state = _nav(event_state, "View", "state")
-        if isinstance(view_state, str) and view_state.lower() in _VIEW_ENDED_STATES:
+        scheduler_working = (
+            _nav(event_state, _SCHEDULER_EVENT_KEY, "state") == _SCHEDULER_WORKING_STATE)
+        view_block = _nav(event_state, "View")
+        view_state = view_block.get("state") if isinstance(view_block, dict) else None
+        view_ended = (isinstance(view_state, str)
+                      and view_state.lower() in _VIEW_ENDED_STATES)
+        view_active = isinstance(view_state, str) and not view_ended
+
+        if view_block is None and not scheduler_working:
+            with self._session_lock:
+                self._polls_without_view += 1
+                stale = self._polls_without_view >= _MAX_POLLS_WITHOUT_VIEW
+            if stale:
+                self._set_session_owned(
+                    False,
+                    reason=f"no View block for {_MAX_POLLS_WITHOUT_VIEW} polls "
+                           f"(driver restarted?)")
+            return
+
+        with self._session_lock:
+            self._polls_without_view = 0
+            if scheduler_working or view_active:
+                self._session_confirmed = True
+            confirmed = self._session_confirmed
+        if scheduler_working:
+            return  # a working plan owns the session regardless of View state
+        if view_ended and confirmed:
             self._set_session_owned(False, reason=f"View state {view_state!r}")
 
     def fetch_preview(self, fullname: str) -> bytes | None:
@@ -933,6 +1025,15 @@ class ScopeWorker:
         max_px = self._settings.preview_max_px
         try:
             img = Image.open(io.BytesIO(raw))
+            # Explicit pixel-count cap AT the ceiling (Pillow's own bomb error
+            # only fires at 2x MAX_IMAGE_PIXELS): the header dimensions are
+            # known before any pixel data is decoded, so an over-cap canvas is
+            # rejected here, before thumbnail/convert can allocate it.
+            if img.width * img.height > _MAX_IMAGE_PIXELS:
+                _log.warning(
+                    "%s: image %dx%d exceeds pixel cap %d; skipping",
+                    self._device_id, img.width, img.height, _MAX_IMAGE_PIXELS)
+                return None
             img.thumbnail((max_px, max_px))
             out = io.BytesIO()
             img.convert("RGB").save(out, format="JPEG", quality=_JPEG_QUALITY)
@@ -963,17 +1064,19 @@ class ScopeWorker:
         boundary is parsed and only a completed ``image/jpeg`` part with real
         JPEG start/end markers is accepted; anything else (the GIF, a
         malformed body) is skipped, never published. Both the wall time and
-        the buffered bytes are bounded (:data:`_PREVIEW_TIMEOUT_SEC` /
-        :data:`_MAX_PREVIEW_BYTES`) so a slow or bloated stream can neither
-        stall the poll loop past the preview timeout nor exhaust memory.
-        Returns the downscaled JPEG (via the shared Pillow path), or ``None``
-        when no acceptable frame arrived within bounds; transport errors
-        propagate to the caller's guard.
+        the buffered bytes are bounded (:data:`_LIVE_GRAB_TIMEOUT_SEC` /
+        :data:`_MAX_PREVIEW_BYTES`) — the deadline is deliberately much
+        shorter than the saved-preview fetch, because a frame arrives
+        immediately when frames exist and the grab runs inline in the poll
+        loop — so a slow or bloated stream can neither stall the loop nor
+        exhaust memory. Returns the downscaled JPEG (via the shared Pillow
+        path), or ``None`` when no acceptable frame arrived within bounds;
+        transport errors propagate to the caller's guard.
         """
-        deadline = time.monotonic() + _PREVIEW_TIMEOUT_SEC
+        deadline = time.monotonic() + _LIVE_GRAB_TIMEOUT_SEC
         buf = b""
         with urllib.request.urlopen(
-                self._imaging_stream_url(), timeout=_PREVIEW_TIMEOUT_SEC) as resp:
+                self._imaging_stream_url(), timeout=_LIVE_GRAB_TIMEOUT_SEC) as resp:
             while time.monotonic() < deadline:
                 chunk = resp.read(_MJPEG_CHUNK_BYTES)
                 if not chunk:
@@ -1070,6 +1173,11 @@ class ScopeWorker:
         logs the exception and returns an empty state with ``reachable=False``),
         a busy ``get_device_state`` raises ``TimeoutError`` that drives the
         backoff here, and a bad preview is swallowed in :meth:`_maybe_publish_preview`.
+        As the ultimate backstop, the WHOLE cycle body is wrapped in a
+        catch-all: no single cycle's exception — however unexpected — may kill
+        the worker thread (there is nothing to restart it); a failed cycle is
+        logged with its traceback, publishes ``offline`` for the cycle, and the
+        next cycle runs as scheduled.
         Each cycle publishes the per-scope availability topic ``online`` only when
         the scope is reachable (the event poll succeeded or ``is_connected()``),
         ``offline`` otherwise, and sets the ``connected`` state key the same way.
@@ -1085,48 +1193,69 @@ class ScopeWorker:
         state_poll = self._settings.state_poll_sec
 
         while True:
-            now = time.time()
-            state, saved_fullname, reachable = self._poll_once(now)
-            # The connectivity binary_sensor must have a producer: drive it from
-            # the scope's Alpaca `connected` property (the event poll alone can't
-            # distinguish "scope idle" from "scope disconnected").
-            connected = self._alpaca.is_connected()
-            state[_CONNECTED_KEY] = connected
-            reachable = reachable or connected
+            try:
+                now = time.time()
+                state, saved_fullname, reachable = self._poll_once(now)
+                # The connectivity binary_sensor must have a producer: drive it from
+                # the scope's Alpaca `connected` property (the event poll alone can't
+                # distinguish "scope idle" from "scope disconnected").
+                connected = self._alpaca.is_connected()
+                state[_CONNECTED_KEY] = connected
+                reachable = reachable or connected
 
-            if reachable and now - last_slow >= state_poll and now >= slow_backoff_until:
-                last_slow = now
-                try:
-                    state.update(self.extract_device_state(
-                        self._alpaca.action("method_sync", {"method": _DEVICE_STATE_METHOD})))
-                    slow_fail_streak = 0
-                    slow_backoff_until = 0.0
-                except TimeoutError:
-                    # A busy scope answers get_device_state with the wait-timeout
-                    # sentinel; back off so we don't starve seestar_alp's web UI.
-                    slow_fail_streak += 1
-                    slow_backoff_until = now + min(
-                        _SLOW_BACKOFF_MAX_SEC, state_poll * (_SLOW_BACKOFF_BASE ** slow_fail_streak))
-                    _log.info("%s: get_device_state busy; backing off %ds",
-                              self._device_id, int(slow_backoff_until - now))
-                except RuntimeError as exc:
-                    # An Alpaca-level error or an in-band seestar_alp refusal on
-                    # the best-effort health probe: skip this cycle's merge and
-                    # keep the loop alive (the fields simply stay stale).
-                    _log.warning("%s: get_device_state failed; skipping: %s",
-                                 self._device_id, exc)
-                self._poll_park_flags(state)
+                if reachable and now - last_slow >= state_poll and now >= slow_backoff_until:
+                    last_slow = now
+                    try:
+                        state.update(self.extract_device_state(
+                            self._alpaca.action("method_sync", {"method": _DEVICE_STATE_METHOD})))
+                        slow_fail_streak = 0
+                        slow_backoff_until = 0.0
+                    except TimeoutError:
+                        # A busy scope answers get_device_state with the wait-timeout
+                        # sentinel; back off so we don't starve seestar_alp's web UI.
+                        slow_fail_streak += 1
+                        slow_backoff_until = now + min(
+                            _SLOW_BACKOFF_MAX_SEC, state_poll * (_SLOW_BACKOFF_BASE ** slow_fail_streak))
+                        _log.info("%s: get_device_state busy; backing off %ds",
+                                  self._device_id, int(slow_backoff_until - now))
+                    except RuntimeError as exc:
+                        # An Alpaca-level error or an in-band seestar_alp refusal on
+                        # the best-effort health probe: skip this cycle's merge and
+                        # keep the loop alive (the fields simply stay stale).
+                        _log.warning("%s: get_device_state failed; skipping: %s",
+                                     self._device_id, exc)
+                    self._poll_park_flags(state)
 
-            # Publish liveness that reflects reality: 'online' only when the scope
-            # actually answered (or reports connected), never a blind 'online'.
-            availability = _PAYLOAD_AVAILABLE if reachable else _PAYLOAD_NOT_AVAILABLE
-            self._mqtt.publish(self.availability_topic, availability, retain=True)
-            # An unreachable scope publishes only the connectivity flag (so the
-            # Connected sensor flips OFF), not a stale/empty 'online' snapshot.
-            self._mqtt.publish(self.state_topic, json.dumps(state), retain=True)
-            last_preview_file = self._maybe_publish_preview(saved_fullname, last_preview_file)
-            self._maybe_publish_live(reachable)
+                # Publish liveness that reflects reality: 'online' only when the scope
+                # actually answered (or reports connected), never a blind 'online'.
+                availability = _PAYLOAD_AVAILABLE if reachable else _PAYLOAD_NOT_AVAILABLE
+                self._mqtt.publish(self.availability_topic, availability, retain=True)
+                # An unreachable scope publishes only the connectivity flag (so the
+                # Connected sensor flips OFF), not a stale/empty 'online' snapshot.
+                self._mqtt.publish(self.state_topic, json.dumps(state), retain=True)
+                last_preview_file = self._maybe_publish_preview(saved_fullname, last_preview_file)
+                self._maybe_publish_live(reachable)
+            except Exception:  # the worker loop must be unkillable (see docstring)
+                _log.exception("%s: poll cycle failed; scope offline this cycle",
+                               self._device_id)
+                self._publish_offline_after_failed_cycle()
             time.sleep(event_poll)
+
+    def _publish_offline_after_failed_cycle(self) -> None:
+        """Best-effort ``offline`` for a cycle the catch-all just absorbed.
+
+        Guarded itself, because it runs inside the catch-all handler: if even
+        the offline publish fails (broker hiccup), that too is logged and
+        swallowed — the loop lives on and the broker's retained/LWT state
+        covers the gap.
+        """
+        try:
+            self._mqtt.publish(
+                self.availability_topic, _PAYLOAD_NOT_AVAILABLE, retain=True)
+            self._publish_live_availability(False)
+        except Exception:
+            _log.exception("%s: offline publish after failed cycle also failed",
+                           self._device_id)
 
     def _poll_once(self, now: float):
         """One fast event tap: build state, the saved-stack path, and reachability.
