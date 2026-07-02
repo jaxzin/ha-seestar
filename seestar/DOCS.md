@@ -82,12 +82,12 @@ Setting **both** `scopes` and `alpaca_host` is rejected at startup; so is settin
 
 ## What gets published
 
-Per telescope, one HA device with ~46 entities plus two `camera` entities: the
+Per telescope, one HA device with ~46 telemetry entities, the Phase-2 control
+entities and their **Last command result** sensor
+(see [Controls (Phase 2)](#controls-phase-2)), plus two `camera` entities: the
 saved stacked preview, and a **Live view** camera fed from seestar_alp's `/vid`
-stream. The live camera only shows frames while a session was started *through
-this bridge* (the firmware only serves live frames to the session's owning
-client); otherwise it reads unavailable while the stacked preview keeps working
-independently. Entities:
+stream — live only for sessions started from Home Assistant
+(see [Live view camera](#live-view-camera)). Telemetry entities:
 
 - **Cameras**: telephoto (cam 0) and wide-field (cam 1) target / state / mode /
   gain / LP-filter, plus the active camera.
@@ -104,6 +104,97 @@ independently. Entities:
   dew heater, firmware, last alert.
 
 A copy-paste starter dashboard is in [`examples/stargazing.yaml`](../examples/stargazing.yaml).
+
+## Controls (Phase 2)
+
+> **⚠️ These controls MOVE A PHYSICAL TELESCOPE.** A goto slews the mount, Park
+> stows the arm, Shutdown powers the whole device off. Keep **Controls enabled**
+> and **Allow power actions** OFF whenever you are not actively driving the
+> scope, and write automations that target the safety switches **deliberately**
+> — arm before commanding, disarm after — rather than leaving the scope
+> permanently armed.
+
+### Safety model — read this first
+
+Each scope gets two safety switches, **both OFF by default**:
+
+- **Controls enabled** gates *everything*. While it is off, every command —
+  button, number, switch, select, or text — is refused before anything reaches
+  the driver, so a stray automation or a mis-tap can't move the scope.
+- **Allow power actions** *additionally* gates the destructive power actions:
+  **Startup sequence**, **Park**, and **Shutdown**. Both switches must be on
+  for those three.
+
+A refused command is never silent: the refusal and its reason are published to
+the **Last command result** sensor, e.g.
+`refused: goto: controls are disabled (arm 'Controls enabled' first)`. The same
+sensor shows `ok: …` for accepted commands and `error: …` when the scope itself
+rejected or failed one — it is the first place to look when a button "did
+nothing".
+
+### Control entities
+
+All controls are per-scope: arming or commanding one telescope never affects
+another.
+
+| Entity | What it does | Notes |
+|---|---|---|
+| **Controls enabled** (switch) | Master safety gate for every command. | Default OFF — nothing dispatches while off. |
+| **Allow power actions** (switch) | Second gate for Startup sequence / Park / Shutdown. | Default OFF — both switches must be on for power actions. |
+| **Imaging mode** (select) | Chooses the mode (`star` / `scenery` / `planet` / `sun` / `moon`) that **Start live view** will use. | **Value-only**: changing it does nothing until *Start live view* is pressed. Defaults to `star`. |
+| **Start live view** (button) | Starts an imaging session in the selected imaging mode. | Makes this bridge the session's owning client, which is what turns the [Live view camera](#live-view-camera) on. |
+| **Start stacking** (button) | Starts (restarts) stacking on the current target. | Also starts an HA-owned session. |
+| **Stop** (button) | Stops the running scheduler session. | Only stops scheduler-driven sessions — see [Rough edges](#rough-edges). |
+| **Start mosaic** (button) | Starts a mosaic capture. | |
+| **Start spectra** (button) | Starts a spectra capture. | |
+| **Goto target** (text) | Label for the goto session (e.g. `M31`). | **Name only** — seestar_alp does not resolve names to coordinates. |
+| **Goto RA** (text) | Right ascension for **Goto**. | Decimal hours (`0.7123`) or sexagesimal (`0h42m44s`, `0:42:44`); 0–24 h, J2000. |
+| **Goto Dec** (text) | Declination for **Goto**. | Decimal degrees (`41.269`) or sexagesimal (`+41d16m9s`, `-05:23:28`); ±90°, J2000. |
+| **Goto** (button) | Slews to the stored RA/Dec, labelled with the stored target name. | **Refuses without parseable, in-range coordinates** — it never guesses where a name is. |
+| **Stop goto** (button) | Aborts an in-progress goto. | |
+| **Stack exposure** (number) | Sets the stacking exposure **in milliseconds** (1–60000). | ms end-to-end: solar work is ~1–5 ms; deep-sky stacking is tens of seconds (`10000`, `30000`). |
+| **Focus** (number) | Nudges the focuser by a relative number of steps (−500…500). | |
+| **Mag declination** (number) | Magnetic-declination fudge angle for the compass calibration (±180°). | |
+| **Dew heater** (switch) | Turns the dew heater on or off. | ON applies a fixed power level of 90 (scale 0–100). |
+| **Plate-solve loop** (switch) | Starts/stops the polar-align plate-solve loop. | ON is a no-op on firmware > 2.47 — see [Rough edges](#rough-edges). |
+| **Run plan** (text) | Runs a saved plan **by name**: imports it, then starts the scheduler. | The name resolves under seestar_alp's own `schedule/` directory (where its SSC web UI saves plans); `.json` is appended if omitted. **No paths** — a name containing `/`, `\`, `..`, or starting with `~`/`.` is refused. |
+| **Pause plan** (button) | Pauses the running plan. | |
+| **Continue plan** (button) | Resumes a paused plan. | |
+| **Skip current target** (button) | Skips the plan's current item. | |
+| **Reset current item** (button) | Resets the plan's current item. | |
+| **Startup sequence** (button) | Runs the scope's startup sequence. | **Power-gated.** |
+| **Park** (button) | Stows the mount arm. | **Power-gated.** Park only stows — it never powers off. |
+| **Shutdown** (button) | Powers off the **whole device** (parks, then halts). | **Power-gated.** |
+
+### Live view camera
+
+The **Live view** camera shows seestar_alp's real-time `/vid` stacking stream —
+but **only while the imaging session was started from Home Assistant** (via
+*Start live view*, *Start stacking*, or *Run plan*). The scope's firmware serves
+live frames only to the session's **owning client**; when this bridge starts the
+session, it is that owner. A session started from the phone app belongs to the
+phone, so the camera reads **unavailable** and you get only the saved-stack
+**Live stacked preview** — that is a firmware boundary the bridge surfaces
+rather than works around, and the saved-stack preview keeps working
+independently either way.
+
+### Rough edges
+
+Per the Phase-2 "expose everything" directive, the full control surface is
+published even where it is rough. Known edges, verified against seestar_alp:
+
+- **Stop only stops scheduler-driven sessions.** The *Stop* button maps to
+  seestar_alp's `stop_scheduler`, so a live view or stack started outside the
+  scheduler is not stopped by it.
+- **Plate-solve loop ON is a no-op on firmware newer than 2.47.** seestar_alp
+  answers `start_plate_solve_loop` with a "Deprecated" warning and does nothing;
+  turning the switch OFF still calls `stop_plate_solve_loop`.
+- **In-band scope refusals surface via Last command result.** seestar_alp
+  reports many refusals as an HTTP 200 with an error body (e.g. importing a
+  plan while a scheduler is already active, or running the startup sequence
+  while busy). The bridge detects that shape and publishes it as `error: …` on
+  the **Last command result** sensor — the command reached the driver, but the
+  scope said no.
 
 ## Running without the Supervisor
 

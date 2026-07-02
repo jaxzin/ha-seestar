@@ -7,6 +7,8 @@ telemetry — targets, stacking progress, plate-solve results, Alt/Az, mount and
 health — plus a live stacked-image preview, as auto-discovered entities. One HA
 device per telescope, zero hand-edited config files.
 
+It also drives the scope: HA-driven **control** (sessions, goto, saved plans, settings, power) plus a **live view camera**, gated behind per-scope safety switches that default off — see [Controls (Phase 2)](seestar/DOCS.md#controls-phase-2).
+
 ## What it is
 
 A single HA app that bundles everything you need:
