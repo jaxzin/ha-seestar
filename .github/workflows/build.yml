@@ -41,17 +41,16 @@ jobs:
 
   build:
     name: Build ${{ matrix.arch }} add-on image
-    runs-on: ${{ matrix.runner }}
+    # home-assistant/builder ships an amd64-only builder image (exec format
+    # error on arm64 runners); it cross-builds aarch64 via qemu internally.
+    # Cheap here: the Debian base means wheels-only, no compilation under qemu.
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     strategy:
       matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
+        arch: [amd64, aarch64]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
