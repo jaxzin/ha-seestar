@@ -215,6 +215,10 @@ against seestar_alp:
   HA-started session forgets that HA owns it: telemetry and the saved-stack
   preview keep working, but the **Live view** camera stays unavailable until
   the **next** session started from Home Assistant.
+- **Mount mode updates instantly only on drivers that publish the
+  `get_event_state` mount block** (the seestar_alp fork, or an upstream release
+  containing [PR #750](https://github.com/smart-underworld/seestar_alp/pull/750));
+  on stock releases it falls back to the slower `get_device_state` poll.
 
 ### Deliberate omissions
 

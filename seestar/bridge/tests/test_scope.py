@@ -207,6 +207,50 @@ def test_slewing_false_when_goto_complete():
     assert state["slewing"] is False
 
 
+# --- mount mode from the event tap (the fork's synthetic ``mount`` block) ------
+#
+# The seestar_alp fork (upstream PR #750) injects ``{"Event": "Mount",
+# "equ_mode": <bool>}`` into get_event_state once the driver has CONFIRMED the
+# mode from the device; stock upstream lacks the block entirely, so the event
+# path must never infer a mode when it is absent (get_device_state remains the
+# fallback producer there).
+
+def test_mount_mode_equatorial_from_event_mount_block():
+    payload = {**EVENT_STATE, "mount": {"Event": "Mount", "equ_mode": True}}
+    state = _worker().build_state(payload)
+    assert state["mount_mode"] == "Equatorial"
+
+
+def test_mount_mode_altaz_from_event_mount_block():
+    payload = {**EVENT_STATE, "mount": {"Event": "Mount", "equ_mode": False}}
+    state = _worker().build_state(payload)
+    assert state["mount_mode"] == "Alt-Az"
+
+
+def test_mount_mode_absent_without_event_mount_block():
+    # EVENT_STATE is a stock-driver snapshot (no ``mount`` block): the event
+    # path sets nothing — presence of the block is the ONLY trigger.
+    state = _worker().build_state(EVENT_STATE)
+    assert "mount_mode" not in state
+
+
+def test_mount_mode_ignores_non_boolean_equ_mode():
+    # Only a real bool is trustworthy; a truthy int is never coerced.
+    payload = {**EVENT_STATE, "mount": {"Event": "Mount", "equ_mode": 1}}
+    state = _worker().build_state(payload)
+    assert "mount_mode" not in state
+
+
+def test_event_and_device_state_mount_mode_strings_agree():
+    # Both producers of mount_mode must render the SAME display strings, or the
+    # sensor would flap between spellings as the two paths alternate.
+    for equ_mode in (True, False):
+        event = _worker().build_state(
+            {"mount": {"Event": "Mount", "equ_mode": equ_mode}})
+        device = ScopeWorker.extract_device_state({"mount": {"equ_mode": equ_mode}})
+        assert event["mount_mode"] == device["mount_mode"]
+
+
 # --- run-cycle helpers: connectivity + availability liveness -------------------
 
 #: Sentinel raised from a patched time.sleep to break run()'s infinite loop after

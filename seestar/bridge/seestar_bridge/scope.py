@@ -87,6 +87,13 @@ _PLAN_WORKING = "working"
 #: scope, so we treat it as absent rather than a real equatorial fix.
 _SITE_UNSET_VALUES = (None, 0)
 
+#: Display strings for the mount-mode sensor, shared by BOTH producers of the
+#: field — the fork's synthetic ``mount`` event block (fast path) and the
+#: ``get_device_state`` probe (fallback) — so the sensor can never flap between
+#: spellings as the two paths alternate.
+_MOUNT_MODE_EQUATORIAL = "Equatorial"
+_MOUNT_MODE_ALT_AZ = "Alt-Az"
+
 # --- MQTT sub-topic + camera constants -----------------------------------------
 
 _BASE_TOPIC_PREFIX = "seestar"
@@ -294,6 +301,11 @@ def _pillow_decode_errors() -> tuple[type[Exception], ...]:
     return (Image.DecompressionBombError, UnidentifiedImageError)
 
 
+def _mount_mode_label(equ_mode: bool) -> str:
+    """The mount-mode sensor's display string for one ``equ_mode`` flag."""
+    return _MOUNT_MODE_EQUATORIAL if equ_mode else _MOUNT_MODE_ALT_AZ
+
+
 def _nav(obj: Any, *path: Any, default: Any = None) -> Any:
     """Safely navigate nested dict/list by keys/indices (Phase-1 ``_nav``)."""
     for key in path:
@@ -449,6 +461,7 @@ class ScopeWorker:
         self._extract_cameras(state, g)
         self._extract_stacking(state, g)
         self._extract_pointing(state, g, unix_t)
+        self._extract_mount(state, g)
         self._extract_plan(state, g)
         self._extract_detections(state, g)
         self._extract_misc(state, g)
@@ -542,6 +555,19 @@ class ScopeWorker:
                 state["ra"], state["dec"], self._site_lat, self._site_lon, when)
 
     @staticmethod
+    def _extract_mount(state, g):
+        # Fast-path mount mode: the seestar_alp fork (upstream PR #750) injects
+        # a synthetic ``mount`` block into get_event_state — but only once the
+        # driver has CONFIRMED the mode from the device, so presence is
+        # trustworthy and the sensor updates on the event cadence instead of
+        # waiting for the slow get_device_state probe. Stock upstream lacks the
+        # block entirely; anything but a real bool is ignored (never inferred),
+        # leaving extract_device_state as the sole producer on stock drivers.
+        equ_mode = g("mount", "equ_mode")
+        if isinstance(equ_mode, bool):
+            state["mount_mode"] = _mount_mode_label(equ_mode)
+
+    @staticmethod
     def _extract_plan(state, g):
         if g("ViewPlan", "plan", "plan_name"):
             state["plan_name"] = g("ViewPlan", "plan", "plan_name")
@@ -586,7 +612,7 @@ class ScopeWorker:
             return _nav(device_state, *path, default=default)
 
         if d("mount", "equ_mode") is not None:
-            out["mount_mode"] = "Equatorial" if d("mount", "equ_mode") else "Alt-Az"
+            out["mount_mode"] = _mount_mode_label(bool(d("mount", "equ_mode")))
         if d("focuser", "step") is not None:
             out["focuser"] = d("focuser", "step")
         if d("setting", "heater_enable") is not None:

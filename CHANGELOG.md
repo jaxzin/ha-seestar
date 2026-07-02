@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Mount mode now reads instantly from the fork's `get_event_state` mount block
+  when available (falls back to `get_device_state` on stock seestar_alp).
 - The add-on image now builds from the Home Assistant **Debian** base
   (`base-debian:trixie`, Python 3.13) instead of Alpine: `opencv-python`
   publishes no musllinux wheels, so the Alpine base forced an hours-long
