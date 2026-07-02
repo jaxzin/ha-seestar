@@ -1,3 +1,7 @@
-# Run the init-config bashio script in a contenv environment; a non-zero exit
-# from the script aborts startup (bashio::exit.nok surfaces an actionable error).
-execlineb -P /etc/s6-overlay/scripts/init-config
+# Exec the init-config bashio script directly: s6-rc parses this file as an
+# execline command line, and the kernel honors the script's #!/usr/bin/env
+# bashio shebang. (Running it through `execlineb -P` instead would make
+# execlineb parse the BASH script as execline and die trying to exec `set`.)
+# A non-zero exit from the script aborts startup (bashio::exit.nok surfaces an
+# actionable error).
+/etc/s6-overlay/scripts/init-config
