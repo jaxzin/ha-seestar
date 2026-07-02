@@ -7,6 +7,9 @@
   "_comment_alpaca_webui_port": "The seestar_alp web-UI port the bridge reads /config.json (or the /config HTML page) from for the preview address. Default 5432.",
   "alpaca_webui_port": 5432,
 
+  "_comment_imaging_port": "Port of seestar_alp's imaging server on the Alpaca host, where the Live view camera grabs its /vid MJPEG frames. Default 7556 (seestar_alp's stock bind); change only if your seestar_alp rebinds it.",
+  "imaging_port": 7556,
+
   "discovery_prefix": "homeassistant",
   "event_poll_sec": 10,
   "state_poll_sec": 30,
