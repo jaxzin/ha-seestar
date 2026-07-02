@@ -1,4 +1,4 @@
-#!/usr/bin/env bashio
+#!/command/with-contenv bashio
 # shellcheck shell=bash
 # ==============================================================================
 # init-config oneshot — runs once before the longruns.
