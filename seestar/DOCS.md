@@ -5,7 +5,36 @@ published as auto-discovered MQTT entities — one HA device per telescope. The 
 bundles the [seestar_alp](https://github.com/smart-underworld/seestar_alp) Alpaca
 driver, or reuses one you already run.
 
-## Install
+## Getting started
+
+New to this? Walk it top to bottom: check the prerequisites, install the add-on,
+confirm the entities appear, then note what an idle scope looks like on the first
+run.
+
+### Before you begin
+
+Tick all of these off first — the install assumes them:
+
+- [ ] **Home Assistant OS or Supervised.** This is a Supervisor add-on. On **HA
+  Container / Core**, or to run it on a separate machine (e.g. a dedicated
+  Raspberry Pi), skip the add-on and use the
+  [`docker-compose.yml`](../docker-compose.yml) path instead — see
+  [Running without the Supervisor](#running-without-the-supervisor).
+- [ ] **An MQTT broker.** Install the official **Mosquitto broker** add-on **and**
+  add the **MQTT integration** (**Settings → Devices & Services → Add integration
+  → MQTT**). The bridge auto-resolves Mosquitto's host/port/credentials from the
+  Supervisor, so with those two in place you configure nothing else for MQTT.
+- [ ] **A supported ZWO Seestar, on your network in station mode.** The **S30**,
+  **S30 Pro**, and **S50** are supported. Power it on and, in the **Seestar
+  app**, join it to your home Wi-Fi in **station mode** — *not* its default
+  self-hosted **AP mode**, where the scope is its own hotspot and Home Assistant
+  can't reach it. Put it on the **same subnet** as Home Assistant.
+- [ ] **The scope's LAN IP.** Find it in the **Seestar app** (device/network
+  settings) or your router's **DHCP client list**. You'll paste it into the
+  add-on. A DHCP reservation for the scope is worth setting so the address
+  doesn't move.
+
+### Install the add-on
 
 1. In Home Assistant, go to **Settings → Add-ons → Add-on Store** (on newer
    builds, **Settings → Apps**), open the **⋮** menu (top right), choose
@@ -16,16 +45,44 @@ driver, or reuses one you already run.
    ```
 
 2. The **Seestar for Home Assistant** app appears in the store. Install it.
-3. Open the **Configuration** tab, add your telescope under **Telescopes**
-   (a name and the scope's LAN IP), and **Start** the app.
+3. Open the **Configuration** tab and tell it where your scope is. Most people
+   want **bundled** mode: leave **External Alpaca driver** (`alpaca_host`) blank
+   and add your telescope under **Telescopes** — a name and the scope's LAN IP
+   from the checklist above. If you already run seestar_alp elsewhere, use
+   **external** mode instead — see
+   [Bundled vs external driver](#bundled-vs-external-driver). Then **Start** the
+   app.
 4. Open the **Log** tab to watch it connect, enumerate the scope, and publish
-   MQTT discovery. The new device shows up under
-   **Settings → Devices & Services → MQTT**.
+   MQTT discovery.
 
-> This app runs under the Home Assistant **Supervisor** (Home Assistant OS or
-> Supervised). On **HA Container / Core**, or to run it on a separate machine
-> (e.g. a dedicated Raspberry Pi), use the [`docker-compose.yml`](../docker-compose.yml)
-> path instead — see [Running without the Supervisor](#running-without-the-supervisor).
+### Verify it worked
+
+- In the **Log** tab you should see the **broker connection** succeed followed by
+  **`discovered`** lines — one burst per scope as it publishes its entities. If
+  the log complains about MQTT, revisit the Mosquitto/MQTT-integration
+  prerequisite; if it can't reach the scope, re-check station mode and the IP.
+- The new device appears under **Settings → Devices & Services → MQTT** — open it
+  to see the ~46 telemetry entities, the control entities, and the two cameras.
+  (Entity IDs are derived from the device **name**, not the discovery ID — see
+  [the note below](#entity-ids-are-derived-from-the-entity-name-not-the-discovery-id).)
+
+### What to expect on the first run
+
+An **idle scope that has never stacked** looks half-empty, and that's normal:
+
+- The **Live stacked preview** camera is **blank** until the scope has a saved
+  stack — the preview shows the *last* stacked image, and there isn't one yet.
+- Imaging fields (target, stack state, frames, plate-solve) read **idle /
+  unknown** until a session is running.
+
+Point the scope at something and start a stacking session (from the Seestar app,
+or from Home Assistant once you've armed [Controls](#controls-phase-2)); the
+telemetry and preview fill in within a few seconds. Two behaviours are worth
+knowing up front so they don't read as bugs: **controls and some live device-state
+fields need a firmware auth key on firmware ≥ 7.18** (telemetry and the preview do
+not — see [Firmware 7.18+ authentication](#firmware-718-authentication)), and
+**during an exposure the slower device-state fields refresh only at idle gaps**
+between frames (see [Known caveats](#known-caveats)).
 
 ## MQTT — zero-config with the Mosquitto add-on
 
@@ -76,7 +133,7 @@ Setting **both** `scopes` and `alpaca_host` is rejected at startup; so is settin
 | `mqtt_ssl` | bool | `false` | Connect to the broker over TLS. Relevant only when overriding `mqtt_host`. |
 | `discovery_prefix` | string | `homeassistant` | MQTT discovery topic prefix. Must match Home Assistant's MQTT integration setting; change only if you customized it there. |
 | `event_poll_sec` | int (1–3600) | `10` | How often to poll the fast Alpaca event stream for imaging telemetry. Lower is more responsive; higher is gentler on the driver. |
-| `state_poll_sec` | int (1–3600) | `30` | How often to poll the slower device-state call (mount mode, focuser, battery, firmware). |
+| `state_poll_sec` | int (1–3600) | `30` | How often to poll the slower device-state call (mount mode, focuser, battery, firmware). These fields refresh only at idle gaps during a capture — see [Behavior during active imaging](#known-caveats). |
 | `preview_max_px` | int (256–4096) | `1280` | Longest-edge limit for the stacked preview before publishing; larger previews are downscaled to this. |
 | `log_level` | enum | `info` | Verbosity of the bridge and bundled driver. One of `trace`, `debug`, `info`, `notice`, `warning`, `error`, `fatal`. Use `debug` or `trace` to diagnose a connection problem. |
 
@@ -98,12 +155,19 @@ stream — live only for sessions started from Home Assistant
 - **Plan & objects**: plan name, plan running, objects in frame, catalog objects,
   last saved file.
 - **Pointing & mount**: altitude, azimuth (computed from the plate solve + the
-  scope's GPS, so they stay correct during capture), tracking, slewing, goto
-  state, parked, at-home, mount mode, focuser, filter position.
+  scope's GPS, so they keep updating during capture — unlike the slower
+  device-state fields; see [Behavior during active imaging](#known-caveats)),
+  tracking, slewing, goto state, parked, at-home, mount mode, focuser, filter
+  position.
 - **Health**: connected, sensor temperature, battery, charger, storage used,
   dew heater, firmware, last alert.
 
-A copy-paste starter dashboard is in [`examples/stargazing.yaml`](../examples/stargazing.yaml).
+The recommended way to put these entities on a dashboard is the purpose-built
+companion card, [**seestar-lovelace-card**](https://github.com/jaxzin/seestar-lovelace-card)
+— one scope per card, HACS-installable, no YAML wrangling. If you'd rather not use
+HACS, the repo also ships a copy-paste, stock-card starter dashboard in
+[`examples/stargazing.yaml`](../examples/stargazing.yaml) that maps every published
+entity.
 
 ## Controls (Phase 2)
 
@@ -113,6 +177,13 @@ A copy-paste starter dashboard is in [`examples/stargazing.yaml`](../examples/st
 > scope, and write automations that target the safety switches **deliberately**
 > — arm before commanding, disarm after — rather than leaving the scope
 > permanently armed.
+
+> **Firmware ≥ 7.18 needs an auth key for controls.** These commands use the
+> scope's synchronous COMMAND channel, which firmware 7.18+ gates behind a
+> challenge-response interop auth key configured in seestar_alp. Without it,
+> commands are refused by the scope even with both safety switches on. Telemetry
+> and the preview are unaffected. See
+> [Firmware 7.18+ authentication](#firmware-718-authentication).
 
 ### Safety model — read this first
 
@@ -298,16 +369,31 @@ calls this out and tells you which prefix to replace.
   "discovered" lines. If it complains about MQTT, install the Mosquitto add-on or
   set `mqtt_host`.
 - Confirm the scope is reachable: the bridge enumerates scopes from seestar_alp,
-  so in bundled mode the scope `host` must be correct and on the LAN.
+  so in bundled mode the scope `host` must be correct and on the LAN. A Seestar in
+  its default **AP mode** is its own Wi-Fi hotspot and is **not reachable** from
+  Home Assistant — it must first be joined to your home Wi-Fi in **station mode**
+  via the Seestar app, on the same subnet as HA (see
+  [Before you begin](#before-you-begin)).
 - Check Home Assistant's MQTT integration `discovery_prefix` matches the
   `discovery_prefix` option (both default to `homeassistant`).
+- On **firmware ≥ 7.18**, the telemetry entities still appear without an auth key,
+  but device-state fields and controls need one — see
+  [Firmware 7.18+ authentication](#firmware-718-authentication).
 
 ### The preview camera is blank
 
-Telemetry never depends on the preview. The preview needs each scope's own HTTP
-address, discovered separately (see [Known caveats](#known-caveats)). If discovery
-can't resolve it, that one scope's preview is skipped while all its other entities
-keep updating.
+On a fresh install the most common cause is simply that **no stacking session has
+run yet.** The preview camera shows the scope's *last saved stack*, so it stays
+blank until the scope has stacked at least once, and the imaging telemetry reads
+idle/unknown until a session is running. Point the scope at a target and start
+stacking (from the Seestar app, or from Home Assistant) and the preview fills in —
+this is expected, not a fault.
+
+If the preview stays blank *after* a session has stacked, it's an address problem.
+Telemetry never depends on the preview: it needs each scope's own HTTP address,
+discovered separately (see [Known caveats](#known-caveats)). If discovery can't
+resolve it, that one scope's preview is skipped while all its other entities keep
+updating.
 
 ## Known caveats
 
@@ -341,8 +427,34 @@ These are deliberate v1 limitations, documented so they don't surprise you:
    stable name up front; if you must rename, expect to re-point dashboards and
    automations at the new IDs.
 
+   <a id="firmware-718-authentication"></a>
+
+6. **Firmware 7.18+ authentication.** The telemetry (~46 entities) and the
+   stacked-image **preview** work with **no auth key** — they ride the scope's
+   **event stream**, which is unauthenticated. But on **firmware ≥ 7.18** the
+   scope gates its synchronous COMMAND channel behind a **challenge-response
+   interop auth key**, so **device-state fields** (mount mode, focuser, battery,
+   firmware, park/home, tracking) and **all** [Phase-2 controls](#controls-phase-2)
+   require that key to be configured **in seestar_alp**. Without it those entities
+   stay unknown and commands are refused by the scope, while telemetry and the
+   preview keep working. Obtaining and configuring the key is a seestar_alp
+   concern, not something this add-on ships — see the
+   [seestar_alp project](https://github.com/smart-underworld/seestar_alp) and its
+   community for how.
+
+   <a id="behavior-during-active-imaging"></a>
+
+7. **Behavior during active imaging.** During an exposure the scope firmware
+   **stalls synchronous `get_device_state` queries**, so the slower device-state
+   fields (mount mode, focuser, battery, firmware, park/home, tracking) refresh
+   only at the **idle gaps between frames** — not continuously. This is expected,
+   not a stuck sensor. The **event-stream** telemetry is unaffected and keeps
+   updating live throughout a capture: target, stacking frames, plate-solve,
+   computed Alt/Az, and the preview.
+
 ## Licensing
 
 This app's code is licensed under the [Apache License, Version 2.0](../LICENSE).
-The bundled `seestar_alp` driver is GPL-3.0; see [NOTICE](../NOTICE) for attribution
-and the preserved component licenses.
+The bundled `seestar_alp` driver is GPL-3.0; see [NOTICE](../NOTICE) and
+[THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md) for attribution and the
+preserved component licenses.

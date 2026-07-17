@@ -758,7 +758,7 @@ def test_live_grab_deadline_is_short_and_named():
 # -- settings: the imaging base derivation ------------------------------------------
 
 def _minimal_options(**extra):
-    return {"alpaca_host": "davis-bridge:5555", "mqtt_host": "broker", **extra}
+    return {"alpaca_host": "seestar-alp:5555", "mqtt_host": "broker", **extra}
 
 
 def test_imaging_port_defaults_to_7556():

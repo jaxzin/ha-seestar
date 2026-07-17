@@ -1,0 +1,10 @@
+blank_issues_enabled: false
+contact_links:
+  - name: seestar_alp driver / firmware auth
+    url: https://github.com/smart-underworld/seestar_alp
+    about: >-
+      Questions about the underlying Alpaca driver, the firmware 7.18+ interop
+      auth key, or scope-side behaviour belong upstream.
+  - name: Seestar dashboard card
+    url: https://github.com/jaxzin/seestar-lovelace-card
+    about: The companion Lovelace card that renders these entities.

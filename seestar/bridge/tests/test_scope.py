@@ -184,7 +184,7 @@ def test_filter_and_health_extracted():
 
 
 def test_altaz_populates_when_site_and_radec_present():
-    state = _worker(site=(41.414, -73.3034)).build_state(EVENT_STATE, unix_t=1782799000.0)
+    state = _worker(site=(40.0, -74.0)).build_state(EVENT_STATE, unix_t=1782799000.0)
     assert state["altitude"] is not None
     assert state["azimuth"] is not None
     assert -90.0 <= state["altitude"] <= 90.0
@@ -509,7 +509,7 @@ def test_driver_restart_keeps_last_known_state(monkeypatch):
     # JSON must still carry the last-known target/frames/pointing — the sparse
     # snapshot must not overwrite the retained full state.
     mqtt_client = _FakeMqtt()
-    alpaca = _ScriptedAlpaca(event_states=[EVENT_STATE, {}], connected=True, site=41.414)
+    alpaca = _ScriptedAlpaca(event_states=[EVENT_STATE, {}], connected=True, site=40.0)
     worker = _run_cycles(alpaca, mqtt_client, monkeypatch, cycles=2)
     states = _state_payloads(mqtt_client, worker)
     assert len(states) == 2

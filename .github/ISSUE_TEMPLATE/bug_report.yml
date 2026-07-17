@@ -1,0 +1,64 @@
+name: Bug report
+description: Something in the add-on or bridge isn't working
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Thanks for taking the time to file a report. For **security** issues,
+        please don't use this form — see SECURITY.md.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+      placeholder: The Live view camera stays "unavailable" even though a session is running...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Configure the add-on with ...
+        2. Start it
+        3. Open the device page ...
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Driver mode
+      options:
+        - Bundled (add-on runs seestar_alp)
+        - External (alpaca_host points at my own seestar_alp)
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Seestar model
+      placeholder: S30 / S30 Pro / S50
+    validations:
+      required: true
+  - type: input
+    id: firmware
+    attributes:
+      label: Seestar firmware version
+      description: From the Seestar app. Firmware 7.18+ needs an interop auth key for controls — see DOCS.md.
+      placeholder: "e.g. 7.20"
+  - type: input
+    id: install
+    attributes:
+      label: Home Assistant install type + add-on version
+      placeholder: HA OS 14.x, add-on 1.0.6
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: >-
+        From the add-on **Log** tab (set log_level to debug first if you can).
+        Scrub anything sensitive.
+      render: shell

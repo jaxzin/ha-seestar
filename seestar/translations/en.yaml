@@ -30,8 +30,9 @@ configuration:
   mqtt_port:
     name: MQTT port
     description: >-
-      Broker port. Leave at 0 to take it from the Supervisor MQTT service; set
-      explicitly (e.g. 1883, or 8883 for TLS) only when overriding mqtt_host.
+      Broker port. Only used when overriding mqtt_host; ignored while mqtt_host is
+      blank (the Supervisor MQTT service supplies the port). Set e.g. 8883 for a
+      TLS broker.
   mqtt_username:
     name: MQTT username
     description: Username for the broker. Leave blank when using the Mosquitto add-on.

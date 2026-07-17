@@ -42,8 +42,9 @@ ENV PATH="/opt/venv/bin:${PATH}"
 
 # --- seestar_alp (GPL-3.0, bundled at arm's length over the Alpaca socket) -----
 # Shallow-clone the pinned tag and install its pinned requirements. The four
-# LICENSE-*.txt files live at the repo root and are preserved in the image as-is
-# (see /app/seestar_alp/LICENSE*.txt); NOTICE links the upstream project.
+# LICENSE*.txt files (LICENSE.txt + three LICENSE-<component>.txt) live at the
+# repo root and are preserved in the image as-is (see /app/seestar_alp/LICENSE*.txt);
+# NOTICE links the upstream project.
 RUN git clone --depth 1 --branch "${SEESTAR_ALP_REF}" \
         https://github.com/smart-underworld/seestar_alp /app/seestar_alp \
     && pip install --no-cache-dir -r /app/seestar_alp/requirements.txt
