@@ -50,8 +50,10 @@ version:
 
 **Before you begin**, make sure you have:
 
-- **Home Assistant OS or Supervised** (this is a Supervisor add-on; for HA
-  Container / Core use the [`docker-compose.yml`](docker-compose.yml) path below).
+- **Home Assistant OS or Supervised**, **2026.7 or later** (the version this is
+  developed and tested against; older builds may work but aren't verified). This
+  is a Supervisor add-on; for HA Container / Core use the
+  [`docker-compose.yml`](docker-compose.yml) path below.
 - The official **Mosquitto broker** add-on installed **and** the **MQTT
   integration** configured — the bridge auto-resolves the broker from there.
 - A supported **ZWO Seestar** (**S30**, **S30 Pro**, or **S50**), powered on and

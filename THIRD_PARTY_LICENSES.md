@@ -31,4 +31,15 @@ docker exec <container> cat /app/seestar_alp/LICENSE.txt
 The corresponding source is the public upstream repository at the pinned tag:
 <https://github.com/smart-underworld/seestar_alp/tree/v3.2.2>.
 
+### What this means if you redistribute the image
+
+The add-on's own code stays Apache-2.0. But because the **distributed GHCR image
+includes GPL-3.0 software** (seestar_alp), anyone who redistributes the image is
+subject to the **GPL-3.0** for that component — in practice: keep the bundled
+license texts intact and make the corresponding source available (it already is,
+at the pinned-tag URL above). We take this conservative stance regardless of the
+arm's-length process boundary, so the GPL obligation is unambiguous. If you build
+your own image from a different `SEESTAR_ALP_REF`, update the corresponding-source
+reference to match.
+
 See [NOTICE](NOTICE) for the attribution summary.
