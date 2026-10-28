@@ -412,6 +412,8 @@ class ScopeWorker:
         self._stored_inputs: dict[str, str] = {
             control.IMAGING_MODE_KEY: control.DEFAULT_IMAGING_MODE,
         }
+        # Last switch state mirrored from the scope's own reading (_sync_switch_states).
+        self._switch_synced: dict[str, bool] = {}
         # Last-known merged state snapshot (see the _CYCLE_FRESH_KEYS block):
         # seeded once from our own retained state topic at startup, then merged
         # set-when-present each cycle so a driver restart's sparse events never
@@ -905,6 +907,9 @@ class ScopeWorker:
             self._track_session_ownership(key)
             if self._control_is_stateful(key):
                 self._publish_control_state(key, payload)
+                # the echo may not be what the scope ends up doing: let the next
+                # reading re-mirror the switch even if it equals the previous one
+                self._switch_synced.pop(key, None)
         self._publish_command_result(result.status.value, result.reason or key)
 
     def _publish_command_result(self, status: str, detail: str) -> None:
@@ -1412,6 +1417,7 @@ class ScopeWorker:
                 self._published_state.update(state)
                 self._mqtt.publish(
                     self.state_topic, json.dumps(self._published_state), retain=True)
+                self._sync_switch_states(state)
                 last_preview_file = self._maybe_publish_preview(saved_fullname, last_preview_file)
                 self._maybe_publish_live(reachable)
             except Exception:  # the worker loop must be unkillable (see docstring)
@@ -1419,6 +1425,29 @@ class ScopeWorker:
                                self._device_id)
                 self._publish_offline_after_failed_cycle()
             time.sleep(event_poll)
+
+    #: Switches whose retained state is only the echo of the last accepted command,
+    #: paired with the read-only field that reports what the scope actually does.
+    _SWITCH_FEEDBACK = (("dew_heater_set", "dew_heater"), ("tracking_set", "tracking"))
+
+    def _sync_switch_states(self, state: dict) -> None:
+        """Mirror the scope's reported heater/tracking state onto the switches.
+
+        A switch's state_topic otherwise only echoes the last command the bridge
+        accepted, so it drifts when the scope changes on its own (app, reboot,
+        auto power-off) or ignores the command: HA would show "on" while the
+        heater is off. Only fields observed THIS cycle are mirrored, and only on
+        change, so a missing reading never flips the switch.
+        """
+        synced = self._switch_synced
+        for switch_key, field in self._SWITCH_FEEDBACK:
+            if field not in state or state[field] is None:
+                continue
+            value = bool(state[field])
+            if synced.get(switch_key) is value:
+                continue
+            synced[switch_key] = value
+            self._publish_control_state(switch_key, value)
 
     def _publish_offline_after_failed_cycle(self) -> None:
         """Best-effort ``offline`` for a cycle the catch-all just absorbed.

@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every MQTT connect **and reconnect**, not only at startup. Previously a broker
   blip left the Last-Will `offline` retained, greying out every control entity
   until the add-on restarted.
+- **Dew heater** and **Tracking** switches follow the scope's own reading
+  instead of only echoing the last accepted command, so they no longer show *on*
+  while the heater is off (changed in the app, after a reboot, or ignored).
 
 ### Changed (breaking)
 

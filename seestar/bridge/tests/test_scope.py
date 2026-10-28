@@ -828,3 +828,43 @@ def test_device_state_storage_computed_from_lowercase_keys():
 
 def test_device_state_storage_empty_volume_list():
     assert "disk_used_pct" not in ScopeWorker.extract_device_state({"storage": {"storage_volume": []}})
+
+
+class _RecordingMqtt:
+    def __init__(self):
+        self.published = []
+
+    def publish(self, topic, payload, retain=False):
+        self.published.append((topic, payload))
+
+
+def test_switch_states_follow_the_scopes_own_reading():
+    """The heater/tracking switches mirror what the scope reports, only on change."""
+    mqtt = _RecordingMqtt()
+    worker = ScopeWorker(alpaca=_StubAlpaca(), device=DEVICE, settings=None,
+                         mqtt_client=mqtt, scope_http_base=None)
+    worker._sync_switch_states({"dew_heater": False, "tracking": True})
+    topics = dict(mqtt.published)
+    heater = [t for t in topics if t.endswith("dew_heater_set/state") or "dew_heater_set" in t]
+    tracking = [t for t in topics if "tracking_set" in t]
+    assert heater and topics[heater[0]] == "OFF"
+    assert tracking and topics[tracking[0]] == "ON"
+
+    mqtt.published.clear()
+    worker._sync_switch_states({"dew_heater": False})        # unchanged -> no publish
+    worker._sync_switch_states({})                           # not observed -> no publish
+    assert mqtt.published == []
+    worker._sync_switch_states({"dew_heater": True})
+    assert [p for _, p in mqtt.published] == ["ON"]
+
+
+def test_switch_resyncs_after_a_command_echo():
+    """Command echoed ON, scope still reports OFF -> the switch goes back to OFF."""
+    mqtt = _RecordingMqtt()
+    worker = ScopeWorker(alpaca=_StubAlpaca(), device=DEVICE, settings=None,
+                         mqtt_client=mqtt, scope_http_base=None)
+    worker._sync_switch_states({"dew_heater": False})
+    worker._switch_synced.pop("dew_heater_set", None)      # what a dispatched echo does
+    mqtt.published.clear()
+    worker._sync_switch_states({"dew_heater": False})
+    assert [p for t, p in mqtt.published if "dew_heater_set" in t] == ["OFF"]
