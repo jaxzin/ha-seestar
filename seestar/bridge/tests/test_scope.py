@@ -868,3 +868,26 @@ def test_switch_resyncs_after_a_command_echo():
     mqtt.published.clear()
     worker._sync_switch_states({"dew_heater": False})
     assert [p for t, p in mqtt.published if "dew_heater_set" in t] == ["OFF"]
+
+
+def test_wide_camera_switch_follows_the_setting():
+    """S30 series: the wide-camera switch mirrors Setting.wide_cam."""
+    mqtt = _RecordingMqtt()
+    worker = ScopeWorker(alpaca=_StubAlpaca(), device=DEVICE, settings=None,
+                         mqtt_client=mqtt, scope_http_base=None)
+    state = {}
+    worker._extract_cameras(state, lambda *path: True if path == ("Setting", "wide_cam") else None)
+    assert state["active_camera"] == "Wide-field"
+    worker._sync_switch_states(state)
+    assert [p for t, p in mqtt.published if t.endswith("wide_cam/state")] == ["ON"]
+
+
+def test_seed_gives_switches_their_last_known_state(monkeypatch):
+    """A never-commanded switch reads the seeded reading, not 'unknown', after a restart."""
+    retained = json.dumps({"tracking": False, "dew_heater": True}).encode()
+    mqtt_client = _SeedableFakeMqtt(retained=retained)
+    _run_cycles(_ScriptedAlpaca(event_states=[{}], connected=False),
+                mqtt_client, monkeypatch, cycles=1)
+    published = {m[0]: m[1] for m in mqtt_client.published}
+    assert [p for t, p in published.items() if "tracking_set" in t] == ["OFF"]
+    assert [p for t, p in published.items() if "dew_heater_set" in t] == ["ON"]

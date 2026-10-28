@@ -1304,6 +1304,10 @@ class ScopeWorker:
             self._published_state.update(seeded)
             _log.info("%s: seeded %d last-known fields from retained state",
                       self._device_id, len(seeded))
+            # Give the switches their last-known reading right away: a switch
+            # that was never commanded has no retained state and would read
+            # 'unknown' until the scope next reports that field.
+            self._sync_switch_states(seeded)
 
     def _parse_retained_seed(self, payload: Any) -> dict[str, Any]:
         """Filter one retained state payload down to seedable catalog fields.
@@ -1428,10 +1432,11 @@ class ScopeWorker:
 
     #: Switches whose retained state is only the echo of the last accepted command,
     #: paired with the read-only field that reports what the scope actually does.
-    _SWITCH_FEEDBACK = (("dew_heater_set", "dew_heater"), ("tracking_set", "tracking"))
+    _SWITCH_FEEDBACK = (("dew_heater_set", "dew_heater", bool), ("tracking_set", "tracking", bool),
+                        ("wide_cam", "active_camera", lambda v: v == "Wide-field"))
 
     def _sync_switch_states(self, state: dict) -> None:
-        """Mirror the scope's reported heater/tracking state onto the switches.
+        """Mirror the scope's reported heater/tracking/wide-camera state onto the switches.
 
         A switch's state_topic otherwise only echoes the last command the bridge
         accepted, so it drifts when the scope changes on its own (app, reboot,
@@ -1440,10 +1445,10 @@ class ScopeWorker:
         change, so a missing reading never flips the switch.
         """
         synced = self._switch_synced
-        for switch_key, field in self._SWITCH_FEEDBACK:
+        for switch_key, field, to_bool in self._SWITCH_FEEDBACK:
             if field not in state or state[field] is None:
                 continue
-            value = bool(state[field])
+            value = to_bool(state[field])
             if synced.get(switch_key) is value:
                 continue
             synced[switch_key] = value
