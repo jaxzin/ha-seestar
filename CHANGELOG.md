@@ -30,9 +30,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every MQTT connect **and reconnect**, not only at startup. Previously a broker
   blip left the Last-Will `offline` retained, greying out every control entity
   until the add-on restarted.
-- **Dew heater** and **Tracking** switches follow the scope's own reading
-  instead of only echoing the last accepted command, so they no longer show *on*
-  while the heater is off (changed in the app, after a reboot, or ignored).
 
 ### Changed (breaking)
 
@@ -74,6 +71,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Storage used** is now also filled from `get_device_state` (mounted volume's
   `used_percent`, or computed from free/total MB); it stayed unknown on firmware
   that rarely or never sends the `DiskSpace` event (seen on 9.75).
+- **Dew heater**, **Tracking** and **Wide camera** switches follow the scope's
+  own reading instead of only echoing the last accepted command, so they no
+  longer show *on* while the heater is off (changed in the app, after a reboot,
+  or ignored). After an add-on restart they start from the last-known reading
+  instead of *unknown*.
 - External mode: the Open Web UI panel now shows a link to the external
   seestar_alp web UI instead of a 502.
 - The per-scope worker loop is now unkillable by a single cycle's exception: a
