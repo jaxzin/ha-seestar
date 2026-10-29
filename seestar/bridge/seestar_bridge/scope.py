@@ -908,7 +908,8 @@ class ScopeWorker:
             self._alpaca, key, payload,
             controls_enabled=self._controls_enabled,
             allow_power=self._allow_power,
-            stored=self._stored_inputs,
+            stored={**self._stored_inputs,
+                    control.PLAN_ACTIVE_KEY: bool(self._published_state.get("plan_active"))},
         )
         if result.status is DispatchStatus.OK:
             self._track_session_ownership(key)

@@ -402,11 +402,23 @@ def test_focus_number_maps_to_steps():
     assert params["steps"] == 30
 
 
-def test_stop_maps_to_stop_scheduler():
+def test_stop_without_a_plan_stops_the_view():
+    # No plan running: stop_scheduler would only answer "already in complete
+    # state"; the live view / stack / goto is ended with iscope_stop_view.
     alpaca = _StubAlpaca()
-    result = dispatch(alpaca, "stop", {}, controls_enabled=True, allow_power=False)
+    result = dispatch(alpaca, "stop", "PRESS", controls_enabled=True, allow_power=False,
+                      stored={control.PLAN_ACTIVE_KEY: False})
     assert result.status is DispatchStatus.OK
-    assert alpaca.calls[0][0] == "stop_scheduler"
+    assert alpaca.calls == [("method_sync", {"method": "iscope_stop_view"})]
+
+
+def test_stop_with_a_plan_stops_the_scheduler_then_the_view():
+    alpaca = _StubAlpaca()
+    result = dispatch(alpaca, "stop", "PRESS", controls_enabled=True, allow_power=False,
+                      stored={control.PLAN_ACTIVE_KEY: True})
+    assert result.status is DispatchStatus.OK
+    assert alpaca.calls == [("stop_scheduler", {}),
+                            ("method_sync", {"method": "iscope_stop_view"})]
 
 
 # -- Phase-2 spec-catalog additions: gain / tracking / wide-cam / AF / record ------

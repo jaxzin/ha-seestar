@@ -222,7 +222,7 @@ another.
 | **Imaging mode** (select) | Chooses the mode (`star` / `scenery` / `planet` / `sun` / `moon`) that **Start live view** will use. | **Value-only**: changing it does nothing until *Start live view* is pressed. Defaults to `star`. |
 | **Start live view** (button) | Starts an imaging session in the selected imaging mode. | Makes this bridge the session's owning client, which is what turns the [Live view camera](#live-view-camera) on. |
 | **Start stacking** (button) | Starts (restarts) stacking on the current target. | Also starts an HA-owned session. |
-| **Stop** (button) | Stops the running scheduler session. | Only stops scheduler-driven sessions — see [Rough edges](#rough-edges). |
+| **Stop** (button) | Stops what is running: a plan (if one runs), then the live view, stack or goto. | Same as seestar_alp's own live-mode stop (`stop_scheduler` while a plan runs, `iscope_stop_view` always). |
 | **Start mosaic** (button) | Starts a mosaic capture. | |
 | **Start spectra** (button) | Starts a spectra capture. | |
 | **Goto target** (text) | Label for the goto session (e.g. `M31`). | **Name only** — seestar_alp does not resolve names to coordinates. |
@@ -270,9 +270,6 @@ left out is listed under
 [Deliberate omissions](#deliberate-omissions) below. Known edges, verified
 against seestar_alp:
 
-- **Stop only stops scheduler-driven sessions.** The *Stop* button maps to
-  seestar_alp's `stop_scheduler`, so a live view or stack started outside the
-  scheduler is not stopped by it.
 - **Plate-solve loop ON is a no-op on firmware newer than 2.47.** seestar_alp
   answers `start_plate_solve_loop` with a "Deprecated" warning and does nothing;
   turning the switch OFF still calls `stop_plate_solve_loop`.

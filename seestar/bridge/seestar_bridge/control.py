@@ -54,6 +54,7 @@ _SWITCH_OFF = "OFF"
 #    method_sync dispatch rather than a dedicated /action name) ------------------
 _METHOD_SYNC = "method_sync"
 _METHOD_ISCOPE_START_VIEW = "iscope_start_view"
+_METHOD_ISCOPE_STOP_VIEW = "iscope_stop_view"
 #: The MOUNT-STOW command: seestar_device sends ``{"method": "scope_park"}`` to
 #: stow the arm (its shut_down_thread parks with exactly this before powering
 #: off). Park uses THIS and only this.
@@ -98,6 +99,9 @@ IMAGING_MODE_KEY = "imaging_mode"
 GOTO_TARGET_KEY = "goto_target"
 GOTO_RA_KEY = "goto_ra"
 GOTO_DEC_KEY = "goto_dec"
+#: Worker-injected (never an HA entity): whether a plan is running right now,
+#: read from the last-known state when 'Stop' is pressed.
+PLAN_ACTIVE_KEY = "_plan_active"
 
 #: Label sent to goto_target when the operator set coordinates but no name.
 _GOTO_DEFAULT_NAME = "HA goto"
@@ -291,6 +295,24 @@ def _start_live_view(payload: Any) -> Sequence[Call]:
                             "params": {"mode": mode}})]
 
 
+def _stop(payload: Any) -> Sequence[Call]:
+    """Stop whatever is running: the plan if one runs, then the view itself.
+
+    ``stop_scheduler`` alone only ends a SCHEDULER-driven session — a live view,
+    stack or goto started outside a plan kept running, and with no plan the
+    firmware answered "scheduler has already in complete state". This mirrors
+    seestar_alp's own live-mode stop (front/app.py LiveModeResource.on_delete):
+    stop_scheduler while a plan runs, iscope_stop_view otherwise. The view stop
+    always runs (also after a plan stop), so the scope is idle afterwards.
+    """
+    stored = payload if isinstance(payload, dict) else {}
+    calls: list[Call] = []
+    if stored.get(PLAN_ACTIVE_KEY):
+        calls.append(("stop_scheduler", {}))
+    calls.append((_METHOD_SYNC, {"method": _METHOD_ISCOPE_STOP_VIEW}))
+    return calls
+
+
 def _parse_angle(raw: Any, *, label: str) -> float:
     """Parse a decimal or sexagesimal coordinate string to a float, or refuse.
 
@@ -473,8 +495,9 @@ def _as_number(payload: Any) -> float | int:
 #
 # KNOWN ROUGH EDGES (verified against seestar_alp device/telescope.py +
 # device/seestar_device.py):
-# - 'Stop' maps to stop_scheduler, so it only stops a SCHEDULER-driven session;
-#   a live view / stack started outside the scheduler is not stopped by it.
+# - 'Stop' ends a running plan (stop_scheduler) and then the view itself
+#   (iscope_stop_view), like seestar_alp's own live-mode stop; "plan running" is
+#   the last-known plan_active reading the worker passes in.
 # - 'Plate-solve loop' ON is a firmware > 2.47 no-op: seestar_alp answers
 #   start_plate_solve_loop with a "Deprecated" warning and does nothing (OFF
 #   still calls stop_plate_solve_loop).
@@ -494,7 +517,9 @@ CONTROLS: list[Control] = [
                 IMAGING_MODE_KEY, DEFAULT_IMAGING_MODE)),
     Control("start_stack", COMPONENT_BUTTON, "Start stacking",
             _simple("start_stack", {"restart": True})),
-    Control("stop", COMPONENT_BUTTON, "Stop", _simple("stop_scheduler", {})),
+    Control("stop", COMPONENT_BUTTON, "Stop", _stop,
+            payload_from_stored=lambda stored: {
+                PLAN_ACTIVE_KEY: bool(stored.get(PLAN_ACTIVE_KEY))}),
     Control("start_mosaic", COMPONENT_BUTTON, "Start mosaic",
             _simple("start_mosaic", {})),
     Control("start_spectra", COMPONENT_BUTTON, "Start spectra",
