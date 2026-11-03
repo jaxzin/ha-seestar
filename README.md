@@ -146,17 +146,21 @@ them on when you are at the scope, and off afterwards. See
 
 ### 8. Archive the library with Seestar Sync (optional)
 
-**Experimental.** Tested with the Seestar S30 Pro only, and not yet run end to
-end on a live Home Assistant: the Mosquitto lookup and the network-storage
-mapping are still unverified there. It reads the scope's files over SMB
-(TCP 445), so the scope needs a fixed IP, and a full library is hundreds of GB.
+**Experimental.** Tested with the Seestar S30 Pro only. On Home Assistant it has
+been run as a dry run: it starts, finds Mosquitto, sets up its archive under
+`/media` and publishes its device. Not yet confirmed from HA: reading the scope
+over SMB (TCP 445), a real copy, and an archive on network storage added under
+**Settings → System → Storage**. The scope needs a fixed IP, and a full library
+is hundreds of GB.
 
 > **Already run seestar-sync somewhere else** (Docker, Kubernetes, another
 > add-on)? Give this one its own `archive_dir` **and** its own
 > `mqtt_topic_prefix` (e.g. `seestar-sync-ha`) before you start it. The prefix
 > also sets the MQTT client ID, so two instances sharing the default
-> `seestar-sync` keep knocking each other off the broker and fight over one HA
+> `seestar-sync` keep knocking each other off the broker and share one HA
 > device, even in dry run. Two instances on one archive risk two reclaimers.
+> With separate prefixes you get two devices that are both named
+> **Seestar Sync**; rename one on its device page to tell them apart.
 
 1. Give it storage: **Settings → System → Storage → Add network storage**,
    name `seestar`, usage **Media**, pointing at a share on your NAS. It mounts at
