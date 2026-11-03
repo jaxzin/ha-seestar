@@ -151,16 +151,24 @@ end on a live Home Assistant: the Mosquitto lookup and the network-storage
 mapping are still unverified there. It reads the scope's files over SMB
 (TCP 445), so the scope needs a fixed IP, and a full library is hundreds of GB.
 
+> **Already run seestar-sync somewhere else** (Docker, Kubernetes, another
+> add-on)? Give this one its own `archive_dir` **and** its own
+> `mqtt_topic_prefix` (e.g. `seestar-sync-ha`) before you start it. The prefix
+> also sets the MQTT client ID, so two instances sharing the default
+> `seestar-sync` keep knocking each other off the broker and fight over one HA
+> device, even in dry run. Two instances on one archive risk two reclaimers.
+
 1. Give it storage: **Settings → System → Storage → Add network storage**,
    name `seestar`, usage **Media**, pointing at a share on your NAS. It mounts at
    `/media/seestar`, the add-on's default archive folder. The folder must exist
    before you start the add-on; it will not create it.
 2. Add the repository `https://github.com/jaxzin/seestar-sync` (as in step 2)
    and install **Seestar Sync**.
-3. Set **`seestar_host`** to the scope's IP and **Start** it. Leave the rest at
-   its defaults: **dry run on** (it plans and logs, copying and deleting
-   nothing) and **reclaim off** (it never deletes from the scope). With the MQTT
-   options blank it uses Mosquitto and publishes a **Seestar Sync** device.
+3. Set **`seestar_host`** to the scope's IP and **Start** it. If this is your
+   only instance, leave the rest at its defaults: **dry run on** (it plans and
+   logs, copying and deleting nothing) and **reclaim off** (it never deletes from
+   the scope). With the MQTT options blank it uses Mosquitto and publishes a
+   **Seestar Sync** device.
 4. Read its **Log** tab for a few runs, then turn **dry run** off to make real
    copies. Deletion is still impossible until you turn reclaim on.
 
