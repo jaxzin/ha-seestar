@@ -154,20 +154,21 @@ def test_one_state_publish_per_device_from_canned_event_state():
         assert payload["stacked_frames"] == 5
 
 
-def test_main_wires_bridge_lwt_and_publishes_online(monkeypatch):
-    # BLOCKER 2 (b): main must build the client with the bridge LWT (will_topic +
-    # 'offline' payload) and publish the bridge availability 'online' (retained)
-    # after connecting, so the broker can mark the bridge offline if it dies.
+def test_main_wires_bridge_lwt_and_birth(monkeypatch):
+    # main must build the client with the bridge LWT (will_topic + 'offline'
+    # payload) and the 'online' birth payload; the client publishes the birth on
+    # every (re)connect from its on_connect (see test_mqtt).
     calls = {}
     mqtt_client = _FakeMqtt()
 
     def fake_load_settings(_options, _env):
         return _settings("http://stub")
 
-    def fake_build_client(mqtt_settings, *, will_topic=None, will_payload="offline"):
+    def fake_build_client(mqtt_settings, *, will_topic=None, will_payload="offline", birth_payload=None):
         calls["will_topic"] = will_topic
         calls["will_payload"] = will_payload
-        # connect/loop_start are no-ops on the fake; publish is captured.
+        calls["birth_payload"] = birth_payload
+        # connect/loop_start are no-ops on the fake.
         mqtt_client.connect = lambda *a, **k: None
         mqtt_client.loop_start = lambda *a, **k: None
         return mqtt_client
@@ -182,8 +183,7 @@ def test_main_wires_bridge_lwt_and_publishes_online(monkeypatch):
 
     assert calls["will_topic"] == BRIDGE_AVAILABILITY_TOPIC
     assert calls["will_payload"] == "offline"
-    online = [(t, p, r) for t, p, r in mqtt_client.published if t == BRIDGE_AVAILABILITY_TOPIC]
-    assert online == [(BRIDGE_AVAILABILITY_TOPIC, "online", True)]
+    assert calls["birth_payload"] == "online"
 
 
 class _FlakyAlpaca:

@@ -12,9 +12,13 @@
 ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
-# Pinned upstream seestar_alp release. Bumping this is a one-line change plus a
-# re-verify of the /config scrape (see plan Task 9).
-ARG SEESTAR_ALP_REF=v3.2.2
+# Pinned seestar_alp source. Brian's fork (upstream main + PR #749 /config.json +
+# PR #750 mount equ_mode + threaded servers + self-healing firmware >=7.18 auth)
+# is what the standalone deployment ran, so the bundled driver matches it.
+# Return to an upstream tag once those changes land in a release. Bumping the ref
+# is a one-line change (requirements.txt must still install on this base).
+ARG SEESTAR_ALP_REPO=https://github.com/jaxzin/seestar_alp
+ARG SEESTAR_ALP_REF=deploy-2026.07.17
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -46,7 +50,7 @@ ENV PATH="/opt/venv/bin:${PATH}"
 # repo root and are preserved in the image as-is (see /app/seestar_alp/LICENSE*.txt);
 # NOTICE links the upstream project.
 RUN git clone --depth 1 --branch "${SEESTAR_ALP_REF}" \
-        https://github.com/smart-underworld/seestar_alp /app/seestar_alp \
+        "${SEESTAR_ALP_REPO}" /app/seestar_alp \
     && pip install --no-cache-dir -r /app/seestar_alp/requirements.txt
 
 # --- seestar_bridge (our code, Apache-2.0) ------------------------------------

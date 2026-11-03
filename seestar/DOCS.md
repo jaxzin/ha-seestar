@@ -135,6 +135,7 @@ Setting **both** `scopes` and `alpaca_host` is rejected at startup; so is settin
 | `event_poll_sec` | int (1–3600) | `10` | How often to poll the fast Alpaca event stream for imaging telemetry. Lower is more responsive; higher is gentler on the driver. |
 | `state_poll_sec` | int (1–3600) | `30` | How often to poll the slower device-state call (mount mode, focuser, battery, firmware). These fields refresh only at idle gaps during a capture — see [Behavior during active imaging](#known-caveats). |
 | `preview_max_px` | int (256–4096) | `1280` | Longest-edge limit for the stacked preview before publishing; larger previews are downscaled to this. |
+| `interop_pem` | password | `""` | **Bundled mode only.** Firmware ≥ 7.18 interop auth key (RSA private key). Paste the PEM, the PEM with literal `\n` instead of newlines (the field is single-line), or its base64. It is written to a root-only file on the container's ephemeral filesystem and referenced from the generated `config.toml`; it is never logged. Blank = unauthenticated (see [Firmware 7.18+ authentication](#firmware-718-authentication)). In external mode configure the key on your own seestar_alp instead. |
 | `log_level` | enum | `info` | Verbosity of the bridge and bundled driver. One of `trace`, `debug`, `info`, `notice`, `warning`, `error`, `fatal`. Use `debug` or `trace` to diagnose a connection problem. |
 
 ## What gets published
@@ -399,10 +400,12 @@ updating.
 
 These are deliberate v1 limitations, documented so they don't surprise you:
 
-1. **Bundled seestar_alp is pinned to `v3.2.2`.** That release predates the
-   machine-readable `/config.json` endpoint
-   ([smart-underworld/seestar_alp#749](https://github.com/smart-underworld/seestar_alp/pull/749)).
-   This does **not** affect bundled mode — the bridge reads the scope address
+1. **Bundled seestar_alp is pinned to the `jaxzin/seestar_alp` fork tag
+   `deploy-2026.07.17`.** The fork is upstream `main` plus
+   [#749](https://github.com/smart-underworld/seestar_alp/pull/749)
+   (`/config.json`), [#750](https://github.com/smart-underworld/seestar_alp/pull/750)
+   (mount mode from `get_event_state`), threaded servers and non-fatal,
+   self-healing firmware ≥ 7.18 auth. Bundled mode reads the scope address
    straight from `config.toml` inside the container. In **external** mode against
    an older seestar_alp, the bridge falls back to scraping the `/config` HTML page
    for the preview address; once you run a seestar_alp new enough to expose
@@ -435,12 +438,12 @@ These are deliberate v1 limitations, documented so they don't surprise you:
    scope gates its synchronous COMMAND channel behind a **challenge-response
    interop auth key**, so **device-state fields** (mount mode, focuser, battery,
    firmware, park/home, tracking) and **all** [Phase-2 controls](#controls-phase-2)
-   require that key to be configured **in seestar_alp**. Without it those entities
+   require that key to be configured **in seestar_alp**. In bundled mode, paste it
+   into the `interop_pem` option. Without it those entities
    stay unknown and commands are refused by the scope, while telemetry and the
-   preview keep working. Obtaining and configuring the key is a seestar_alp
-   concern, not something this add-on ships — see the
-   [seestar_alp project](https://github.com/smart-underworld/seestar_alp) and its
-   community for how.
+   preview keep working. Obtaining the key is not something this add-on ships —
+   see the [seestar_alp project](https://github.com/smart-underworld/seestar_alp)
+   and its community for how.
 
    <a id="behavior-during-active-imaging"></a>
 

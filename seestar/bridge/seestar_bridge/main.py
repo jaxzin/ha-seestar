@@ -204,16 +204,17 @@ def main() -> None:
     # Alpaca clients (bound to the real device numbers) are built in build_workers.
     alpaca = Alpaca(settings.alpaca_base, 0)
 
+    # The birth message is published (retained) from build_client's on_connect on
+    # the first connect AND every reconnect; the LWT flips it back to 'offline'
+    # if the process dies without a clean disconnect.
     mqtt_client = build_client(
         settings.mqtt,
         will_topic=BRIDGE_AVAILABILITY_TOPIC,
         will_payload=_PAYLOAD_NOT_AVAILABLE,
+        birth_payload=_PAYLOAD_AVAILABLE,
     )
     mqtt_client.connect(settings.mqtt.host, settings.mqtt.port, keepalive=_MQTT_KEEPALIVE_SEC)
     mqtt_client.loop_start()
-    # Announce the bridge alive (retained) once connected; the LWT above flips
-    # this back to 'offline' if the process dies without a clean disconnect.
-    mqtt_client.publish(BRIDGE_AVAILABILITY_TOPIC, _PAYLOAD_AVAILABLE, retain=True)
 
     workers = build_workers(alpaca, settings, mqtt_client)
     if not workers:
