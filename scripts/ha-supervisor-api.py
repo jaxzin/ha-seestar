@@ -16,26 +16,31 @@ Usage (run where the LAN is reachable, e.g. over ssh to heimdall):
     HA_WS_URL=wss://homeassistant.iot.jaxzin.com/api/websocket \\
       ha-supervisor-api.py < request.stdin
 
-Prints the JSON result. The `interop_pem` value is redacted from the output.
+Prints the JSON result with every non-empty password/token/secret/key/pem value masked.
 """
 import json
 import os
 import sys
 
-import websocket  # websocket-client
-
-REDACT = "interop_pem"
+REDACT = "interop_pem"  # key the PEM is injected under
+_SENSITIVE = ("pem", "password", "token", "secret", "key")
 
 
 def _redact(value):
+    """Recursively mask any non-empty value whose key looks sensitive."""
     if isinstance(value, dict):
-        return {k: ("<redacted>" if k == REDACT and v else _redact(v)) for k, v in value.items()}
+        return {
+            k: ("<redacted>" if v and any(s in str(k).lower() for s in _SENSITIVE) else _redact(v))
+            for k, v in value.items()
+        }
     if isinstance(value, list):
         return [_redact(v) for v in value]
     return value
 
 
 def main() -> int:
+    import websocket  # websocket-client
+
     lines = sys.stdin.read().split("\n")
     token = lines[0].strip()
     request = json.loads(lines[1])
