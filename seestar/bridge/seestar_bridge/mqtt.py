@@ -58,8 +58,15 @@ def build_client(
     *,
     will_topic: str | None = None,
     will_payload: str = _PAYLOAD_NOT_AVAILABLE,
+    birth_payload: str | None = None,
 ) -> mqtt.Client:
     """Build (but do not connect) a paho client from resolved MQTT settings.
+
+    When ``birth_payload`` is given together with ``will_topic``, an ``on_connect``
+    publishes it (retained) to the will topic on EVERY successful connect AND
+    reconnect. The will flips the retained topic to ``offline`` whenever the
+    broker link drops; without a birth message on reconnect that stale
+    ``offline`` would stay retained and grey out every entity.
 
     TLS uses the system CA store (``CERT_REQUIRED``); ``ssl=False`` connects in
     the clear (typical for the in-cluster Mosquitto add-on). When ``will_topic``
@@ -71,6 +78,13 @@ def build_client(
         mqtt.CallbackAPIVersion.VERSION2,
         client_id=f"{_CLIENT_ID_PREFIX}-{os.getpid()}",
     )
+    if will_topic and birth_payload is not None:
+        def _publish_birth(_client, _userdata, _flags, reason_code, _properties=None):
+            if reason_code != 0:
+                return
+            client.publish(will_topic, birth_payload, retain=True)
+
+        client.on_connect = _publish_birth
     if mqtt_settings.username:
         client.username_pw_set(mqtt_settings.username, mqtt_settings.password)
     if mqtt_settings.ssl:
@@ -109,8 +123,13 @@ def set_router(
     scope worker.
     """
     filters = tuple(command_filters)
+    previous_on_connect = client.on_connect
 
     def _on_connect(_client, _userdata, _flags, reason_code, _properties=None):
+        # Chain any on_connect installed earlier (e.g. the bridge birth message)
+        # so installing the router never silently replaces it.
+        if previous_on_connect is not None:
+            previous_on_connect(_client, _userdata, _flags, reason_code, _properties)
         # A non-zero reason_code means the CONNACK was refused; there is nothing
         # to subscribe to, so log and return rather than silently no-op.
         if reason_code != 0:

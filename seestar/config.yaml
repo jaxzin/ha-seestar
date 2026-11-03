@@ -7,7 +7,7 @@
 # image from GHCR ({arch} is substituted per architecture).
 name: Seestar for Home Assistant
 slug: seestar
-version: "1.0.6"
+version: "1.0.7"
 description: >-
   Live Seestar imaging telemetry + a stacked-image preview in Home Assistant via
   MQTT discovery. Bundles the seestar_alp driver, or reuses your own.
@@ -55,6 +55,7 @@ options:
   event_poll_sec: 10
   state_poll_sec: 30
   preview_max_px: 1280
+  interop_pem: ""
   log_level: info
 
 schema:
@@ -78,4 +79,6 @@ schema:
   event_poll_sec: int(1,3600)
   state_poll_sec: int(1,3600)
   preview_max_px: int(256,4096)
+  # Bundled mode: firmware >= 7.18 interop key (PEM, "\n"-escaped PEM, or base64).
+  interop_pem: password?
   log_level: list(trace|debug|info|notice|warning|error|fatal)

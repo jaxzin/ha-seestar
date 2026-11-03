@@ -120,6 +120,32 @@ case "${log_level_raw}" in
     fatal) log_level_raw='critical' ;;
 esac
 log_level_upper="$(printf '%s' "${log_level_raw}" | tr '[:lower:]' '[:upper:]')"
+# Firmware >= 7.18 interop auth key. The `interop_pem` option may hold the PEM
+# with real newlines, with literal "\n" sequences (the HA option field is
+# single-line), or base64 of the PEM. Materialize it to a root-only file on the
+# container's ephemeral /run (never /data, so it is not left on disk across
+# restarts) and point seestar_alp at it. The value is never logged.
+readonly INTEROP_PEM_PATH="/run/seestar/seestar_client_key.pem"
+has_interop_pem=false
+if bashio::config.has_value 'interop_pem'; then
+    pem="$(bashio::config 'interop_pem')"
+    pem="${pem//\\n/$'\n'}"
+    if [[ "${pem}" != *"-----BEGIN"* ]]; then
+        pem="$(printf '%s' "${pem}" | base64 -d 2>/dev/null || true)"
+    fi
+    if [[ "${pem}" != *"-----BEGIN"*"PRIVATE KEY-----"* ]]; then
+        bashio::exit.nok \
+            "The 'interop_pem' option is set but is not a PEM private key (nor base64 of one)."
+    fi
+    mkdir -p "$(dirname "${INTEROP_PEM_PATH}")"
+    (umask 077 && printf '%s\n' "${pem}" > "${INTEROP_PEM_PATH}")
+    unset pem
+    has_interop_pem=true
+    bashio::log.info "Interop PEM supplied; firmware 7.18+ authentication enabled."
+else
+    bashio::log.warning \
+        "No interop_pem set: on firmware >= 7.18 device state and all controls will be refused."
+fi
 
 {
     # Bind to all interfaces so the bridge reaches Alpaca by container DNS and
@@ -131,6 +157,13 @@ log_level_upper="$(printf '%s' "${log_level_raw}" | tr '[:lower:]' '[:upper:]')"
     echo ""
     echo "[webui_settings]"
     echo "uiport = ${WEBUI_PORT}"
+    echo ""
+    echo "[seestar_initialization]"
+    # Parity with the standalone deployment (upstream defaults this to true).
+    echo "save_all_frames = false"
+    if [ "${has_interop_pem}" = true ]; then
+        echo "interop_pem = '${INTEROP_PEM_PATH}'"
+    fi
     echo ""
     # Surface the driver's logs in the add-on log stream (default is a file) and
     # honor the operator's log_level (uppercase, the form seestar_alp expects).

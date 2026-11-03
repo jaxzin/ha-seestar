@@ -24,6 +24,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (Apache-2.0 + GPL-3.0 attribution), and the `seestar_bridge` Python package
   skeleton with a pytest setup.
 
+### Fixed
+
+- The retained `seestar/bridge/availability` topic is now republished `online` on
+  every MQTT connect **and reconnect**, not only at startup. Previously a broker
+  blip left the Last-Will `offline` retained, greying out every control entity
+  until the add-on restarted.
+
+### Changed (bundled mode)
+
+- Bundled seestar_alp now builds from the `jaxzin/seestar_alp` fork tag
+  `deploy-2026.07.17` (the build the standalone heimdall deployment ran) instead
+  of upstream `v3.2.2`.
+- New `interop_pem` option (bundled mode): firmware >= 7.18 auth key, written to
+  a root-only ephemeral file and referenced from the generated `config.toml`.
+  The rendered config also sets `save_all_frames = false` to match the
+  standalone deployment.
+
 ### Changed
 
 - Last-known telemetry survives driver and add-on restarts; unknown values stay
