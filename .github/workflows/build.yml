@@ -13,6 +13,11 @@ on:
       - main
     paths:
       - "seestar/**"
+  pull_request:
+    paths:
+      - "seestar/**"
+      - ".github/workflows/build.yml"
+      - "scripts/**"
   workflow_dispatch:
 
 permissions:
@@ -39,8 +44,25 @@ jobs:
           --with pytest --with paho-mqtt --with Pillow
           python -m pytest -q
 
+  # Pull requests: build the image (no login, no push) to prove the Dockerfile.
+  build-check:
+    name: Build amd64 image (no publish)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image without pushing
+        working-directory: seestar
+        run: >-
+          docker build
+          --build-arg BUILD_FROM=ghcr.io/home-assistant/amd64-base-debian:trixie-2026.06.1
+          -t ha-seestar-check .
+
   build:
     name: Build ${{ matrix.arch }} add-on image
+    if: github.event_name != 'pull_request'
     # home-assistant/builder ships an amd64-only builder image (exec format
     # error on arm64 runners); it cross-builds aarch64 via qemu internally.
     # Cheap here: the Debian base means wheels-only, no compilation under qemu.
