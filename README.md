@@ -35,15 +35,18 @@ Seestar into Home Assistant:
 | **Seestar Alpaca driver (seestar_alp)** | The [seestar_alp](https://github.com/smart-underworld/seestar_alp) ASCOM Alpaca driver and its SSC web UI (in the HA sidebar). Talks to the scopes; holds the scope list and the firmware 7.18+ interop key. | Add-on, [jaxzin/ha_seestar_alp](https://github.com/jaxzin/ha_seestar_alp) |
 | **Seestar for Home Assistant** (this repo) | MQTT bridge: telemetry, live stacked preview, live view and safety-gated controls, as one HA device per scope. Finds the driver automatically. | Add-on, this repository |
 | **Seestar Card** | One Lovelace card for a live session: preview, target, stacking, pointing, mount and health. | HACS, [jaxzin/seestar-lovelace-card](https://github.com/jaxzin/seestar-lovelace-card) |
+| **Seestar Sync** (optional, experimental) | Copies the scope's image library over SMB to an archive (ideally a NAS), and can later free space on the scope once copies are verified. | Add-on, [jaxzin/seestar-sync](https://github.com/jaxzin/seestar-sync) |
 
 ```
-Seestar(s) ──> seestar_alp add-on ──Alpaca──> Seestar bridge ──MQTT discovery──> Home Assistant ──> Seestar Card
-     └──────────────── stacked .jpg (preview) ──────┘
+Seestar(s) ──> seestar_alp add-on ──Alpaca──> Seestar bridge ──MQTT discovery──┐
+   │  └───────────── stacked .jpg (preview) ─────┘                             ├──> Home Assistant ──> Seestar Card
+   └──SMB──> Seestar Sync ──> archive (/media) ─────────────MQTT discovery──────┘
 ```
 
 Only the driver talks to the scopes' control API. The bridge reads the driver,
 namespaces each scope by a stable slug of its name and publishes MQTT discovery;
-the card only reads the entities the bridge publishes.
+the card only reads the entities the bridge publishes. Seestar Sync is
+independent of the other three: it reads the scope's SMB share, not Alpaca.
 
 ## Quick Start (Home Assistant OS / Supervised)
 
@@ -140,6 +143,31 @@ Every command is gated by two per-scope switches that default **off**:
 startup, park and shutdown. The card adds its own **Controls** arm toggle. Turn
 them on when you are at the scope, and off afterwards. See
 [Safety model](seestar/DOCS.md#safety-model--read-this-first).
+
+### 8. Archive the library with Seestar Sync (optional)
+
+**Experimental.** Tested with the Seestar S30 Pro only, and not yet run end to
+end on a live Home Assistant: the Mosquitto lookup and the network-storage
+mapping are still unverified there. It reads the scope's files over SMB
+(TCP 445), so the scope needs a fixed IP, and a full library is hundreds of GB.
+
+1. Give it storage: **Settings → System → Storage → Add network storage**,
+   name `seestar`, usage **Media**, pointing at a share on your NAS. It mounts at
+   `/media/seestar`, the add-on's default archive folder. The folder must exist
+   before you start the add-on; it will not create it.
+2. Add the repository `https://github.com/jaxzin/seestar-sync` (as in step 2)
+   and install **Seestar Sync**.
+3. Set **`seestar_host`** to the scope's IP and **Start** it. Leave the rest at
+   its defaults: **dry run on** (it plans and logs, copying and deleting
+   nothing) and **reclaim off** (it never deletes from the scope). With the MQTT
+   options blank it uses Mosquitto and publishes a **Seestar Sync** device.
+4. Read its **Log** tab for a few runs, then turn **dry run** off to make real
+   copies. Deletion is still impossible until you turn reclaim on.
+
+Run only one Seestar Sync per archive. Freeing space on the scope is a separate,
+deliberate step: read the safe first-run procedure in its
+[DOCS.md](https://github.com/jaxzin/seestar-sync/blob/main/addon/DOCS.md)
+before enabling reclaim.
 
 ## Install (HA Container / Core, or a separate host)
 
