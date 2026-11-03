@@ -25,71 +25,149 @@ finds automatically; or point it at a seestar_alp you already run.
 It runs zero-config against the official **Mosquitto** add-on and supports
 **multiple scopes** (one HA device each).
 
-## Architecture
+## The Seestar stack
 
-Two add-ons, two containers:
+This repository is the entry point for four projects that together put a
+Seestar into Home Assistant:
 
-- **seestar_alp** ([jaxzin/ha_seestar_alp](https://github.com/jaxzin/ha_seestar_alp))
-  — the ASCOM Alpaca driver and its SSC web UI. It owns the scope list and the
-  firmware 7.18+ auth key.
-- **seestar_bridge** (this app) — finds the driver by ASCOM Alpaca discovery (or
-  `alpaca_host`), enumerates devices via Alpaca, taps the non-blocking event
-  stream, computes Alt/Az, discovers each scope's address for the preview, and
-  publishes MQTT discovery — one HA device per scope, namespaced by a stable slug
-  of the scope name.
+| Piece | What it does | Install from |
+|---|---|---|
+| **Seestar Alpaca driver (seestar_alp)** | The [seestar_alp](https://github.com/smart-underworld/seestar_alp) ASCOM Alpaca driver and its SSC web UI (in the HA sidebar). Talks to the scopes; holds the scope list and the firmware 7.18+ interop key. | Add-on, [jaxzin/ha_seestar_alp](https://github.com/jaxzin/ha_seestar_alp) |
+| **Seestar for Home Assistant** (this repo) | MQTT bridge: telemetry, live stacked preview, live view and safety-gated controls, as one HA device per scope. Finds the driver automatically. | Add-on, this repository |
+| **Seestar Card** | One Lovelace card for a live session: preview, target, stacking, pointing, mount and health. | HACS, [jaxzin/seestar-lovelace-card](https://github.com/jaxzin/seestar-lovelace-card) |
+| **Seestar Sync** (optional, experimental) | Copies the scope's image library over SMB to an archive (ideally a NAS), and can later free space on the scope once copies are verified. | Add-on, [jaxzin/seestar-sync](https://github.com/jaxzin/seestar-sync) |
 
 ```
-Seestar(s) ──> seestar_alp add-on ──Alpaca──> seestar_bridge ──MQTT discovery──> Home Assistant
-     └──────────────── stacked .jpg (preview) ──────┘
+Seestar(s) ──> seestar_alp add-on ──Alpaca──> Seestar bridge ──MQTT discovery──┐
+   │  └───────────── stacked .jpg (preview) ─────┘                             ├──> Home Assistant ──> Seestar Card
+   └──SMB──> Seestar Sync ──> archive (/media) ─────────────MQTT discovery──────┘
 ```
 
-## Getting started (Home Assistant OS / Supervised)
+Only the driver talks to the scopes' control API. The bridge reads the driver,
+namespaces each scope by a stable slug of its name and publishes MQTT discovery;
+the card only reads the entities the bridge publishes. Seestar Sync is
+independent of the other three: it reads the scope's SMB share, not Alpaca.
 
-New to this? The full, step-by-step walkthrough — with a first-run "what an idle
-scope looks like" tour — lives in
-**[seestar/DOCS.md → Getting started](seestar/DOCS.md#getting-started)**. The short
-version:
+## Quick Start (Home Assistant OS / Supervised)
 
-**Before you begin**, make sure you have:
+This sets up the whole stack in one pass. Each step links to the full reference;
+[seestar/DOCS.md → Getting started](seestar/DOCS.md#getting-started) has the
+longer walkthrough with a first-run tour.
+
+### Before you begin
 
 - **Home Assistant OS or Supervised**, **2026.7 or later** (the version this is
-  developed and tested against; older builds may work but aren't verified). This
-  is a Supervisor add-on; for HA Container / Core use the
-  [`docker-compose.yml`](docker-compose.yml) path below.
-- The official **Mosquitto broker** add-on installed **and** the **MQTT
-  integration** configured — the bridge auto-resolves the broker from there.
-- A supported **ZWO Seestar** (**S30**, **S30 Pro**, or **S50**), powered on and
-  joined to your home Wi-Fi in **station mode** via the Seestar app — *not* its
-  default self-hosted **AP mode**, and on the **same subnet** as HA. Have its LAN
-  IP ready (Seestar app or your router's DHCP list).
+  developed and tested against). For HA Container / Core, see
+  [Install (HA Container / Core, or a separate host)](#install-ha-container--core-or-a-separate-host).
+- **HACS**, for the dashboard card (optional: there is a no-HACS fallback in step 5).
+- A **ZWO Seestar** (**S30**, **S30 Pro** or **S50**) joined to your home Wi-Fi
+  in **station mode** with the Seestar app (*not* its default **AP mode**), on the
+  **same subnet** as HA. Note its LAN IP (Seestar app or your router) and give it
+  a DHCP reservation so it keeps it.
+- On **firmware 7.18 or later**: the seestar_alp **interop key** (a PEM private
+  key) if you want device state and controls. It is not distributed with these
+  projects; without it, telemetry and the preview still work. See
+  [Firmware 7.18+ authentication](seestar/DOCS.md#firmware-718-authentication).
 
-**Then:**
+### 1. MQTT broker
 
-1. Add both repositories — **Settings → Add-ons → Add-on Store → ⋮ →
-   Repositories**:
+Install the official **Mosquitto broker** add-on and start it, then accept the
+**MQTT** integration that HA offers under **Settings → Devices & Services**. With
+both in place the bridge needs no MQTT settings.
 
+### 2. Add the add-on repositories
+
+**Settings → Add-ons → Add-on Store → ⋮ → Repositories**, add both:
+
+```
+https://github.com/jaxzin/ha_seestar_alp
+https://github.com/jaxzin/ha-seestar
+```
+
+### 3. Seestar Alpaca driver
+
+1. Install **Seestar Alpaca driver (seestar_alp)**.
+2. On its **Configuration** tab, add each scope under **Telescopes**: a name and
+   its LAN IP. Pick the name carefully: the bridge derives the HA device and every
+   entity ID from it, and renaming later creates a new device.
+3. On firmware 7.18+, paste the key into **Interop auth key (firmware 7.18+)**.
+4. **Start** it. **Seestar ALP** appears in the sidebar: the SSC web UI, which
+   should show your scope.
+
+Options and ports: [ha_seestar_alp → DOCS.md](https://github.com/jaxzin/ha_seestar_alp/blob/main/seestar_alp/DOCS.md).
+
+### 4. Seestar bridge
+
+1. Install **Seestar for Home Assistant**.
+2. Leave every option at its default: blank `alpaca_host` finds the driver
+   add-on, blank `mqtt_host` uses Mosquitto.
+3. **Start** it and watch its **Log** tab for the broker connection and a
+   `discovered` line per scope.
+4. The scope appears as a device under **Settings → Devices & Services → MQTT**.
+   Its entity IDs start with the slug of the scope name, e.g.
+   `sensor.seestar_s30_pro_telephoto_target` for a scope named *Seestar S30 Pro*.
+   That prefix (`seestar_s30_pro`) is what the card needs.
+
+All options: [Options reference](seestar/DOCS.md#options-reference).
+
+### 5. Dashboard card
+
+1. **HACS → ⋮ → Custom repositories**: add
+   `https://github.com/jaxzin/seestar-lovelace-card`, category **Dashboard**.
+2. Install **Seestar Card** and reload the browser.
+3. Edit a dashboard → **Add card** → **Seestar Card**, or in YAML:
+
+   ```yaml
+   type: custom:seestar-card
+   device: seestar_s30_pro   # the entity prefix from step 4
    ```
-   https://github.com/jaxzin/ha_seestar_alp
-   https://github.com/jaxzin/ha-seestar
-   ```
 
-2. Install **Seestar Alpaca driver (seestar_alp)**, add your scope under
-   **Telescopes** (name + LAN IP) and, on firmware 7.18+, the interop key, then
-   **Start** it.
-3. Install **Seestar for Home Assistant** and **Start** it. Leave `alpaca_host`
-   blank to use the seestar_alp add-on, or set it to reuse your own seestar_alp.
-4. Watch the **Log** tab for the broker connection and `discovered` lines, then
-   find the device under **Settings → Devices & Services → MQTT**.
+Options (accent colour, camera overrides, actions):
+[seestar-lovelace-card README](https://github.com/jaxzin/seestar-lovelace-card#readme).
+**No HACS?** [`examples/stargazing.yaml`](examples/stargazing.yaml) is a
+stock-card dashboard that maps every published entity.
 
-**On the first run**, an idle scope that has never stacked shows a **blank** live
-preview and idle/unknown imaging fields — that's normal; they fill in once a
-stacking session runs. Note too that on **firmware ≥ 7.18** the telemetry and
-preview work without an auth key, but device-state fields and controls need a
-challenge-response interop key configured in seestar_alp — see
-[Firmware 7.18+ authentication](seestar/DOCS.md#firmware-718-authentication).
+### 6. Check it works
 
-See **[seestar/DOCS.md](seestar/DOCS.md)** for the full options reference, how
-the driver is found, the Mosquitto zero-config note, and troubleshooting.
+- The card shows the scope's battery, storage and pointing; the target and
+  stacking fields stay idle or unknown until a session runs.
+- An idle scope that has never stacked has a **blank** live preview. That's
+  normal: it fills in once a stacking session runs.
+- Without the interop key on firmware 7.18+, device-state fields stay unknown
+  and commands are refused.
+
+### 7. Controls (when you want them)
+
+Every command is gated by two per-scope switches that default **off**:
+**Controls enabled** gates all commands, and **Allow power actions** also gates
+startup, park and shutdown. The card adds its own **Controls** arm toggle. Turn
+them on when you are at the scope, and off afterwards. See
+[Safety model](seestar/DOCS.md#safety-model--read-this-first).
+
+### 8. Archive the library with Seestar Sync (optional)
+
+**Experimental.** Tested with the Seestar S30 Pro only, and not yet run end to
+end on a live Home Assistant: the Mosquitto lookup and the network-storage
+mapping are still unverified there. It reads the scope's files over SMB
+(TCP 445), so the scope needs a fixed IP, and a full library is hundreds of GB.
+
+1. Give it storage: **Settings → System → Storage → Add network storage**,
+   name `seestar`, usage **Media**, pointing at a share on your NAS. It mounts at
+   `/media/seestar`, the add-on's default archive folder. The folder must exist
+   before you start the add-on; it will not create it.
+2. Add the repository `https://github.com/jaxzin/seestar-sync` (as in step 2)
+   and install **Seestar Sync**.
+3. Set **`seestar_host`** to the scope's IP and **Start** it. Leave the rest at
+   its defaults: **dry run on** (it plans and logs, copying and deleting
+   nothing) and **reclaim off** (it never deletes from the scope). With the MQTT
+   options blank it uses Mosquitto and publishes a **Seestar Sync** device.
+4. Read its **Log** tab for a few runs, then turn **dry run** off to make real
+   copies. Deletion is still impossible until you turn reclaim on.
+
+Run only one Seestar Sync per archive. Freeing space on the scope is a separate,
+deliberate step: read the safe first-run procedure in its
+[DOCS.md](https://github.com/jaxzin/seestar-sync/blob/main/addon/DOCS.md)
+before enabling reclaim.
 
 ## Install (HA Container / Core, or a separate host)
 
