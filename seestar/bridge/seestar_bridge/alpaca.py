@@ -79,7 +79,7 @@ class Alpaca:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode())
 
-    def action(self, name, params=None):
+    def action(self, name, params=None, timeout=_HTTP_TIMEOUT_SEC):
         """``PUT /api/v1/telescope/{n}/action`` — unwrap ``Value``, detect failure.
 
         Raises ``RuntimeError`` on an Alpaca-level error OR an in-band seestar_alp
@@ -100,7 +100,7 @@ class Alpaca:
                 f"{self._base_url}/api/v1/telescope/{self._device_num}/action",
                 data=body, method="PUT", headers={"Content-Type": "application/json"},
             )
-            with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_SEC) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode())
         if data.get("ErrorNumber"):
             raise RuntimeError(f"{name}: Alpaca error {data['ErrorNumber']} {data.get('ErrorMessage')}")

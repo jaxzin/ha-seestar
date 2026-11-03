@@ -3,44 +3,20 @@
 This app's own code (the `seestar_bridge` and the add-on packaging) is licensed
 under the [Apache License, Version 2.0](LICENSE).
 
-## seestar_alp (GPL-3.0)
+## seestar_alp (GPL-3.0) — not included
 
-The built image bundles the [seestar_alp](https://github.com/smart-underworld/seestar_alp)
-Alpaca driver, pinned to the `jaxzin/seestar_alp` fork (upstream plus a few
-patches) at tag **`deploy-2026.07.17`** (see
-[`seestar/Dockerfile`](seestar/Dockerfile), `SEESTAR_ALP_REF`). seestar_alp is
-licensed under the **GNU General Public License, version 3.0** and is bundled at
-arm's length — it runs as a separate process that this app talks to only over the
-Alpaca HTTP socket.
+The app talks to the [seestar_alp](https://github.com/smart-underworld/seestar_alp)
+ASCOM Alpaca driver over the network (its Alpaca HTTP API). seestar_alp is
+licensed under the **GNU General Public License, version 3.0** and is **not part
+of this app's image**. It runs separately:
 
-The complete, unmodified license texts are cloned from the pinned tag and
-preserved inside the image at `/app/seestar_alp/`:
+- as the **seestar_alp add-on** from
+  [jaxzin/ha_seestar_alp](https://github.com/jaxzin/ha_seestar_alp) (GPL-3.0),
+  whose image and source obligations are documented there; or
+- as any seestar_alp instance you run yourself (`alpaca_host`).
 
-| File | Component | License |
-|---|---|---|
-| `LICENSE.txt` | GPL-3.0 license text | GPL-3.0 |
-| `LICENSE-Seestar_Alp.txt` | seestar_alp — © 2024 Kai Yung / smart-underworld | GPL-3.0 |
-| `LICENSE-AlpacaDevice.txt` | AlpacaDevice — © Bob Denny / ASCOM Initiative | MIT |
-| `LICENSE-PyIndi.txt` | PyIndi | BSD-3-Clause |
-
-To read them from a running container:
-
-```
-docker exec <container> cat /app/seestar_alp/LICENSE.txt
-```
-
-The corresponding source is the public fork repository at the pinned tag:
-<https://github.com/jaxzin/seestar_alp/tree/deploy-2026.07.17>.
-
-### What this means if you redistribute the image
-
-The add-on's own code stays Apache-2.0. But because the **distributed GHCR image
-includes GPL-3.0 software** (seestar_alp), anyone who redistributes the image is
-subject to the **GPL-3.0** for that component — in practice: keep the bundled
-license texts intact and make the corresponding source available (it already is,
-at the pinned-tag URL above). We take this conservative stance regardless of the
-arm's-length process boundary, so the GPL obligation is unambiguous. If you build
-your own image from a different `SEESTAR_ALP_REF`, update the corresponding-source
-reference to match.
+The image is built on the Home Assistant Debian base image, which carries its own
+Debian packages and their licenses; the bridge's Python dependencies are listed,
+hash-pinned, in [`seestar/bridge/requirements.txt`](seestar/bridge/requirements.txt).
 
 See [NOTICE](NOTICE) for the attribution summary.

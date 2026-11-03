@@ -30,8 +30,8 @@ body:
     attributes:
       label: Driver mode
       options:
-        - Bundled (add-on runs seestar_alp)
-        - External (alpaca_host points at my own seestar_alp)
+        - seestar_alp add-on, found automatically (alpaca_host blank)
+        - My own seestar_alp (alpaca_host set)
     validations:
       required: true
   - type: input

@@ -163,7 +163,6 @@ def _settings(imaging_port: int) -> Settings:
     return Settings(
         alpaca_base="http://127.0.0.1:5555",
         webui_base=None,
-        config_toml_path=None,
         discovery_prefix="homeassistant",
         event_poll_sec=10,
         state_poll_sec=30,

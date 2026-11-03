@@ -1,10 +1,10 @@
-# seestar_alp config for the docker-compose BUNDLED mode.
+# seestar_alp config for the docker-compose path.
 #
 # Copy to ./config.toml (next to docker-compose.yml) and edit the [[seestars]]
-# block(s) for your telescope(s). In the HA app this file is generated for you by
-# the s6 init from the `scopes` option; under compose there is no Supervisor, so
-# you provide it directly. seestar_alp reads it from
-# /app/seestar_alp/device/config.toml (the compose bind-mount target).
+# block(s) for your telescope(s). In Home Assistant the seestar_alp add-on
+# generates this file from its options; under compose you provide it directly.
+# seestar_alp reads it from /home/seestar/seestar_alp/device/config.toml (the
+# compose bind-mount target).
 
 [network]
 ip_address = '0.0.0.0'   # bind all interfaces so the bridge reaches Alpaca by container DNS
@@ -13,6 +13,12 @@ imgport = 7556           # imaging API (published)
 
 [webui_settings]
 uiport = 5432            # SSC web UI (published)
+
+# Firmware >= 7.18 interop auth key: mount the PEM file into the container (see
+# docker-compose.yml) and point at it here. Without it, commands and device
+# state are refused; telemetry still flows.
+# [seestar_initialization]
+# interop_pem = "/home/seestar/seestar_alp/secrets/seestar_client_key.pem"
 
 [logging]
 log_to_stdout = true     # surface driver logs to `docker logs`

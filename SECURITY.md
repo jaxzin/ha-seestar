@@ -15,10 +15,11 @@ credit you in the release notes if you'd like.
 ## Scope
 
 This project is a Home Assistant add-on that bridges a ZWO Seestar telescope into
-Home Assistant over MQTT. It bundles the third-party
-[seestar_alp](https://github.com/smart-underworld/seestar_alp) driver at a pinned
-tag; vulnerabilities **in seestar_alp itself** are best reported upstream, though
-a heads-up here is welcome so the pin can be bumped.
+Home Assistant over MQTT. It is a client of the third-party
+[seestar_alp](https://github.com/smart-underworld/seestar_alp) driver, which runs
+separately (the [seestar_alp add-on](https://github.com/jaxzin/ha_seestar_alp) or
+your own instance); vulnerabilities **in seestar_alp itself** are best reported
+upstream.
 
 ## Supported versions
 

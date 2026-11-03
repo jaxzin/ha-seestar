@@ -5,7 +5,7 @@
 #
 # Reads /data/options.json + the environment (MQTT_* exported by init-config when
 # the Mosquitto add-on is used) and publishes MQTT discovery + per-scope state.
-# init-config has already resolved MQTT and, in bundled mode, written config.toml.
+# init-config has already resolved MQTT.
 # ==============================================================================
 
 bashio::log.info "Starting seestar_bridge."

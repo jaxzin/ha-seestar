@@ -1,27 +1,18 @@
 # Option labels + help text shown in the app's Configuration tab. Keys mirror the
 # schema in config.yaml one-for-one.
 configuration:
-  scopes:
-    name: Telescopes
-    description: >-
-      Bundled mode only. One entry per Seestar — each becomes its own Home
-      Assistant device and seeds the bundled driver's config. Each entry needs a
-      name (the HA device name — pick a stable one, since renaming it later
-      creates a new device and new entity IDs) and a host (the telescope's IP
-      address or hostname on your LAN). Leave empty if you point alpaca_host at an
-      existing seestar_alp instead.
   alpaca_host:
-    name: External Alpaca driver
+    name: seestar_alp driver
     description: >-
-      Leave blank to use the bundled driver. To reuse your own seestar_alp
-      instead, set host:port here AND leave the Telescopes list empty — the
-      external instance already knows your scopes. Setting both is rejected at
-      startup.
+      Leave blank to find the seestar_alp add-on automatically (ASCOM Alpaca
+      discovery, then the Supervisor add-on list). To use your own seestar_alp
+      elsewhere, or if more than one is found, set its host:port here (for
+      example 192.168.1.50:5555).
   alpaca_webui_port:
-    name: External web UI port
+    name: seestar_alp web UI port
     description: >-
-      External mode only: the port your seestar_alp serves its /config page on, used
-      to look up each scope's address for the preview. Default 5432.
+      The port your seestar_alp serves its web UI on, where each scope's address
+      for the preview is read. Default 5432; change only if you rebound it.
   mqtt_host:
     name: MQTT host
     description: >-
@@ -67,5 +58,5 @@ configuration:
   log_level:
     name: Log level
     description: >-
-      Verbosity of the bridge and bundled driver logs. Use debug or trace when
-      diagnosing a connection problem. Default info.
+      Verbosity of the bridge log. Use debug or trace when diagnosing a
+      connection problem. Default info.

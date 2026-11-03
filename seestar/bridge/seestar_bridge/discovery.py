@@ -1,29 +1,23 @@
-"""3-tier scope-address discovery (preview only).
+"""Scope-address discovery from the seestar_alp web UI (preview only).
 
 The telemetry path never depends on knowing a scope's own HTTP address; only the
 live stacked-image preview does. We discover ``{device_num: ip_address}`` from,
 in priority order:
 
-  1. seestar_alp's ``config.toml`` (bundled/local mode — the file we wrote).
-  2. ``{webui}/config.json`` — the machine-readable endpoint
+  1. ``{webui}/config.json`` — the machine-readable endpoint
      (smart-underworld/seestar_alp#749), keyed by ``device_num`` directly.
-  3. ``{webui}/config`` HTML — scraped form inputs, keyed by ``ss_name`` which we
+  2. ``{webui}/config`` HTML — scraped form inputs, keyed by ``ss_name`` which we
      match back to each device's Alpaca ``DeviceName`` to recover ``device_num``.
 
-Every source is best-effort: any failure (missing file, connection refused,
-non-200, malformed body) falls through to the next tier, and an unresolved scope
-is simply absent from the result (its preview is skipped). discover_addresses
+Every source is best-effort: any failure (connection refused, non-200,
+malformed body) falls through to the next tier, and an unresolved scope is
+simply absent from the result (its preview is skipped). discover_addresses
 never raises.
 """
 import json
 import re
 import urllib.error
 import urllib.request
-
-try:  # tomllib is stdlib on >=3.11; tomli is the backport for older runtimes.
-    import tomllib as _toml
-except ModuleNotFoundError:  # pragma: no cover - exercised only on <3.11
-    import tomli as _toml
 
 # Document-order pairing of the two relevant config-form inputs. seestar_alp's
 # /config page renders one ss_name + one ss_ip_address per scope, in order.
@@ -39,27 +33,6 @@ _MAX_CONFIG_BYTES = 4 * 1024 * 1024
 
 _DEVICE_NAME_KEY = "DeviceName"
 _DEVICE_NUMBER_KEY = "DeviceNumber"
-
-
-def parse_config_toml(text):
-    """Parse seestar_alp ``config.toml`` -> ``{device_num: ip_address}``.
-
-    Reads the ``[[seestars]]`` array; each entry carries ``device_num`` and
-    ``ip_address``. Entries missing either field are skipped.
-    """
-    data = _toml.loads(text)
-    addresses = {}
-    for entry in data.get("seestars", []):
-        device_num = entry.get("device_num")
-        ip_address = entry.get("ip_address")
-        if device_num is None or not ip_address:
-            continue
-        try:
-            addresses[int(device_num)] = ip_address
-        except (ValueError, TypeError):
-            # Non-numeric device_num in adversarial input -> skip this entry.
-            continue
-    return addresses
 
 
 def parse_config_json(payload):
@@ -96,15 +69,6 @@ def parse_config_html(html):
             addresses[pending_name] = value
             pending_name = None
     return addresses
-
-
-def _read_toml_file(config_toml_path):
-    try:
-        with open(config_toml_path, "rb") as handle:
-            return parse_config_toml(handle.read().decode())
-    except (OSError, ValueError, _toml.TOMLDecodeError):
-        # Missing/unreadable file or malformed TOML -> fall through to the webui.
-        return {}
 
 
 def _read_capped(resp):
@@ -151,18 +115,13 @@ def _fetch_config_html(webui_base, devices):
     return addresses
 
 
-def discover_addresses(*, config_toml_path, webui_base, devices):
+def discover_addresses(*, webui_base, devices):
     """Resolve ``{device_num: ip_address}`` for the preview, best-effort.
 
-    Tries the local ``config.toml`` first, then ``{webui}/config.json``, then the
-    ``{webui}/config`` HTML scrape (matched against ``devices`` by name). Returns
-    the first non-empty source; an empty dict if nothing resolves. Never raises.
+    Tries ``{webui}/config.json``, then the ``{webui}/config`` HTML scrape
+    (matched against ``devices`` by name). Returns the first non-empty source;
+    an empty dict if nothing resolves. Never raises.
     """
-    if config_toml_path:
-        addresses = _read_toml_file(config_toml_path)
-        if addresses:
-            return addresses
-
     if webui_base:
         addresses = _fetch_config_json(webui_base)
         if addresses:

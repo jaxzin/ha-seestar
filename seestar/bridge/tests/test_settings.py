@@ -5,6 +5,7 @@ from seestar_bridge.settings import (
     Settings,
     load_settings,
     python_log_level,
+    with_alpaca_endpoint,
 )
 
 
@@ -19,16 +20,13 @@ def _mqtt_env():
     }
 
 
-def test_bundled_defaults():
-    # No alpaca_host => bundled driver: alpaca on localhost:5555, config.toml path set.
-    options = {"scopes": [{"name": "Backyard"}]}
-    s = load_settings(options, _mqtt_env())
+def test_blank_alpaca_host_leaves_endpoint_for_discovery():
+    # No alpaca_host => nothing to bind yet: main() discovers the seestar_alp.
+    s = load_settings({}, _mqtt_env())
 
     assert isinstance(s, Settings)
-    assert s.alpaca_base == "http://localhost:5555"
-    assert s.config_toml_path is not None
-    # webui derived from the same host as alpaca + the default webui port.
-    assert s.webui_base == "http://localhost:5432"
+    assert s.alpaca_base is None
+    assert s.webui_base is None
     # Spec defaults.
     assert s.discovery_prefix == "homeassistant"
     assert s.event_poll_sec == 10
@@ -36,14 +34,21 @@ def test_bundled_defaults():
     assert s.preview_max_px == 1280
 
 
-def test_external_mode_no_config_toml_and_webui_derived():
-    # alpaca_host set => don't manage seestar_alp config; config_toml_path None,
-    # webui derived from the external host.
+def test_discovered_endpoint_derives_alpaca_and_webui_bases():
+    # A discovered endpoint gets the same derivation as an explicit one,
+    # including a non-default web UI port.
+    s = load_settings({"alpaca_webui_port": 8080}, _mqtt_env())
+    bound = with_alpaca_endpoint(s, "ff29c31e-seestar-alp:5555")
+
+    assert bound.alpaca_base == "http://ff29c31e-seestar-alp:5555"
+    assert bound.webui_base == "http://ff29c31e-seestar-alp:8080"
+
+
+def test_explicit_alpaca_host_binds_and_derives_webui():
     options = {"alpaca_host": "scopebox:5555"}
     s = load_settings(options, _mqtt_env())
 
     assert s.alpaca_base == "http://scopebox:5555"
-    assert s.config_toml_path is None
     assert s.webui_base == "http://scopebox:5432"
 
 
@@ -76,7 +81,7 @@ def test_mqtt_override_beats_env():
 
 
 def test_mqtt_from_env_when_options_blank():
-    options = {"scopes": [{"name": "Backyard"}]}
+    options = {}
     s = load_settings(options, _mqtt_env())
 
     assert s.mqtt == MqttSettings(
@@ -89,15 +94,9 @@ def test_mqtt_from_env_when_options_blank():
 
 
 def test_valueerror_when_mqtt_unresolved():
-    options = {"scopes": [{"name": "Backyard"}]}
+    options = {}
     with pytest.raises(ValueError, match="MQTT"):
         load_settings(options, {})
-
-
-def test_valueerror_when_neither_scopes_nor_alpaca_host():
-    options = {}
-    with pytest.raises(ValueError, match="scopes"):
-        load_settings(options, _mqtt_env())
 
 
 def test_mqtt_port_zero_option_falls_back_to_default():
@@ -118,7 +117,7 @@ def test_mqtt_port_zero_option_falls_back_to_default():
 @pytest.mark.parametrize("port_value", ["", "0"])
 def test_mqtt_port_blank_or_zero_env_falls_back_to_default(port_value):
     # The bashio env exports MQTT_PORT as a string; '' or '0' must resolve to 1883.
-    options = {"scopes": [{"name": "Backyard"}]}
+    options = {}
     env = {**_mqtt_env(), "MQTT_PORT": port_value}
     s = load_settings(options, env)
 
@@ -127,7 +126,7 @@ def test_mqtt_port_blank_or_zero_env_falls_back_to_default(port_value):
 
 
 def test_log_level_defaults_to_info():
-    options = {"scopes": [{"name": "Backyard"}]}
+    options = {}
     s = load_settings(options, _mqtt_env())
 
     assert s.log_level == "info"
@@ -135,14 +134,14 @@ def test_log_level_defaults_to_info():
 
 def test_log_level_flows_through_normalized():
     # An operator-supplied level flows into Settings, normalized to lowercase.
-    options = {"scopes": [{"name": "Backyard"}], "log_level": "DEBUG"}
+    options = {"log_level": "DEBUG"}
     s = load_settings(options, _mqtt_env())
 
     assert s.log_level == "debug"
 
 
 def test_log_level_invalid_rejected():
-    options = {"scopes": [{"name": "Backyard"}], "log_level": "verbose"}
+    options = {"log_level": "verbose"}
     with pytest.raises(ValueError, match="log_level"):
         load_settings(options, _mqtt_env())
 
@@ -151,7 +150,7 @@ def test_log_level_invalid_rejected():
 def test_ha_level_options_are_all_accepted(ha_level):
     # Every value in the config.yaml log_level enum must load (lowercased into
     # Settings) rather than being rejected as an invalid level.
-    options = {"scopes": [{"name": "Backyard"}], "log_level": ha_level}
+    options = {"log_level": ha_level}
     s = load_settings(options, _mqtt_env())
 
     assert s.log_level == ha_level

@@ -3,19 +3,20 @@
 Two config sources feed the bridge:
 
 - **Add-on options** (``options`` dict): the user-facing config from the HA
-  add-on ``config.yaml`` schema — which scopes to bundle, whether to reuse an
-  external seestar_alp (``alpaca_host``), poll cadences, and optional explicit
-  MQTT overrides (``mqtt_*``).
+  add-on ``config.yaml`` schema — an optional explicit seestar_alp endpoint
+  (``alpaca_host``), poll cadences, and optional explicit MQTT overrides
+  (``mqtt_*``).
 - **Environment** (``env`` dict): the bashio ``init-config`` oneshot resolves
   the Supervisor MQTT service and exports it as ``MQTT_HOST/PORT/USERNAME/
   PASSWORD/SSL``. We read those only when the options don't pin MQTT explicitly.
 
 ``load_settings`` collapses both into a single :class:`Settings`, applying the
-spec defaults and failing fast (``ValueError``) when MQTT can't be resolved or
-when the operator pinned neither ``scopes`` (bundled) nor ``alpaca_host``
-(external).
+spec defaults and failing fast (``ValueError``) when MQTT can't be resolved.
+With ``alpaca_host`` blank the Alpaca endpoint is left unresolved
+(``alpaca_base is None``) for :mod:`seestar_bridge.alpaca_discovery` to find;
+:func:`with_alpaca_endpoint` then fills it in.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 # --- spec defaults -----------------------------------------------------------
 DEFAULT_DISCOVERY_PREFIX = "homeassistant"
@@ -41,22 +42,12 @@ _HA_TO_PYTHON_LEVEL = {
     "fatal": "critical",
 }
 
-# Bundled seestar_alp binds Alpaca + the web UI to these ports (see config.toml /
-# the init-config oneshot). In external mode the Alpaca port comes from
-# ``alpaca_host`` and only the web-UI port keeps this default.
-BUNDLED_ALPACA_HOST = "localhost:5555"
+# seestar_alp's stock ports: the web UI (where ``/config.json`` lives, for the
+# preview address) and the imaging server (the live ``/vid`` MJPEG stream) both
+# bind on the SAME host as the Alpaca endpoint. The options only need changing
+# for a seestar_alp rebound elsewhere.
 DEFAULT_ALPACA_WEBUI_PORT = 5432
-
-# seestar_alp's imaging server (the live ``/vid`` MJPEG stream the Phase-2 live
-# camera taps) binds this port on the SAME host as the Alpaca endpoint — both
-# bundled mode and stock external installs use it. The ``imaging_port`` option
-# only needs changing for an external seestar_alp rebound elsewhere.
 DEFAULT_IMAGING_PORT = 7556
-
-# Where the bundled seestar_alp config.toml lives inside the image; the
-# init-config oneshot writes it from the ``scopes`` option, and discovery reads
-# it back for scope-address resolution. Only meaningful in bundled mode.
-BUNDLED_CONFIG_TOML_PATH = "/app/seestar_alp/device/config.toml"
 
 _TRUE_TOKENS = ("1", "true", "yes", "on")
 
@@ -72,9 +63,12 @@ class MqttSettings:
 
 @dataclass(frozen=True)
 class Settings:
-    alpaca_base: str
+    #: ``http://host:port`` of seestar_alp's Alpaca API; ``None`` until resolved
+    #: (``alpaca_host`` blank → discovered at startup, see with_alpaca_endpoint).
+    alpaca_base: str | None
+    #: ``http://host:webui_port`` of seestar_alp's web UI (preview address
+    #: lookup); ``None`` until the Alpaca endpoint is known.
     webui_base: str | None
-    config_toml_path: str | None
     discovery_prefix: str
     event_poll_sec: int
     state_poll_sec: int
@@ -84,6 +78,20 @@ class Settings:
     #: Port of seestar_alp's imaging server on the Alpaca host; the live camera
     #: grabs frames from ``http://<alpaca host>:<imaging_port>/<device_num>/vid``.
     imaging_port: int = DEFAULT_IMAGING_PORT
+    alpaca_webui_port: int = DEFAULT_ALPACA_WEBUI_PORT
+
+
+def with_alpaca_endpoint(settings: Settings, host_port: str) -> Settings:
+    """Return ``settings`` bound to the seestar_alp at ``host_port``.
+
+    Derives the Alpaca base and the web-UI base (same host, the
+    ``alpaca_webui_port``) from one ``host:port`` string.
+    """
+    return replace(
+        settings,
+        alpaca_base=f"http://{host_port}",
+        webui_base=f"http://{_host_of(host_port)}:{settings.alpaca_webui_port}",
+    )
 
 
 def _as_bool(value, default=False):
@@ -180,33 +188,12 @@ def _resolve_mqtt(options, env):
 def load_settings(options, env):
     """Resolve add-on ``options`` + ``env`` into a :class:`Settings`.
 
-    Bundled mode (``alpaca_host`` blank, ``scopes`` set): Alpaca is the bundled
-    driver on ``localhost:5555`` and we manage its config.toml. External mode
-    (``alpaca_host`` set): point Alpaca at that host and leave config.toml alone.
-    The web-UI base (preview only) is derived from the Alpaca host plus
-    ``alpaca_webui_port``.
+    ``alpaca_host`` set: bind to that seestar_alp. Blank: leave the endpoint
+    unresolved for startup discovery.
     """
-    alpaca_host = options.get("alpaca_host") or ""
-    has_scopes = bool(options.get("scopes"))
-    if not alpaca_host and not has_scopes:
-        raise ValueError(
-            "No telescope configured: add at least one entry under the scopes "
-            "option (bundled driver) or set alpaca_host to an external "
-            "seestar_alp (host:port)."
-        )
-
-    bundled = not alpaca_host
-    host_port = BUNDLED_ALPACA_HOST if bundled else alpaca_host
-    alpaca_base = f"http://{host_port}"
-    config_toml_path = BUNDLED_CONFIG_TOML_PATH if bundled else None
-
-    webui_port = int(options.get("alpaca_webui_port", DEFAULT_ALPACA_WEBUI_PORT))
-    webui_base = f"http://{_host_of(host_port)}:{webui_port}"
-
-    return Settings(
-        alpaca_base=alpaca_base,
-        webui_base=webui_base,
-        config_toml_path=config_toml_path,
+    settings = Settings(
+        alpaca_base=None,
+        webui_base=None,
         discovery_prefix=options.get("discovery_prefix", DEFAULT_DISCOVERY_PREFIX),
         event_poll_sec=int(options.get("event_poll_sec", DEFAULT_EVENT_POLL_SEC)),
         state_poll_sec=int(options.get("state_poll_sec", DEFAULT_STATE_POLL_SEC)),
@@ -214,4 +201,7 @@ def load_settings(options, env):
         log_level=_resolve_log_level(options.get("log_level")),
         mqtt=_resolve_mqtt(options, env),
         imaging_port=int(options.get("imaging_port", DEFAULT_IMAGING_PORT)),
+        alpaca_webui_port=int(options.get("alpaca_webui_port", DEFAULT_ALPACA_WEBUI_PORT)),
     )
+    alpaca_host = (options.get("alpaca_host") or "").strip()
+    return with_alpaca_endpoint(settings, alpaca_host) if alpaca_host else settings

@@ -1,9 +1,9 @@
-"""Tests for the 3-tier scope-address discovery.
+"""Tests for the scope-address discovery (preview only).
 
 discover_addresses resolves {device_num: ip_address} for the preview only,
-trying config.toml (bundled/local) -> {webui}/config.json -> {webui}/config
-HTML scrape, in that priority. Any source failure falls through; it never
-raises. Missing entries are simply absent (the preview is skipped for them).
+trying {webui}/config.json -> {webui}/config HTML scrape, in that priority. Any
+source failure falls through; it never raises. Missing entries are simply
+absent (the preview is skipped for them).
 """
 import json
 import threading
@@ -13,22 +13,9 @@ from seestar_bridge.discovery import (
     discover_addresses,
     parse_config_html,
     parse_config_json,
-    parse_config_toml,
 )
 
 # --- fixtures -----------------------------------------------------------------
-
-CONFIG_TOML = """
-[[seestars]]
-name = "Seestar Alpha"
-ip_address = "10.0.0.11"
-device_num = 1
-
-[[seestars]]
-name = "Seestar Beta"
-ip_address = "10.0.0.12"
-device_num = 2
-"""
 
 CONFIG_JSON = {
     "devices": [
@@ -87,10 +74,6 @@ def _serve(routes, html_404=False):
 # --- parser unit tests --------------------------------------------------------
 
 
-def test_parse_config_toml_maps_device_num_to_ip():
-    assert parse_config_toml(CONFIG_TOML) == {1: "10.0.0.11", 2: "10.0.0.12"}
-
-
 def test_parse_config_json_maps_device_num_to_ip():
     assert parse_config_json(CONFIG_JSON) == {1: "10.0.0.21", 2: "10.0.0.22"}
 
@@ -105,25 +88,10 @@ def test_parse_config_html_pairs_name_to_ip_in_document_order():
 # --- priority / fallback ------------------------------------------------------
 
 
-def test_toml_present_is_used(tmp_path):
-    toml_file = tmp_path / "config.toml"
-    toml_file.write_text(CONFIG_TOML)
-    # webui still up with different addresses; toml must win.
+def test_json_200_is_used():
     srv, base = _serve({"/config.json": CONFIG_JSON})
     try:
         result = discover_addresses(
-            config_toml_path=str(toml_file), webui_base=base, devices=DEVICES
-        )
-    finally:
-        srv.shutdown()
-    assert result == {1: "10.0.0.11", 2: "10.0.0.12"}
-
-
-def test_toml_absent_then_json_200(tmp_path):
-    srv, base = _serve({"/config.json": CONFIG_JSON})
-    try:
-        result = discover_addresses(
-            config_toml_path=str(tmp_path / "missing.toml"),
             webui_base=base,
             devices=DEVICES,
         )
@@ -136,7 +104,6 @@ def test_json_404_falls_back_to_html_scrape(tmp_path):
     srv, base = _serve({"/config": CONFIG_HTML}, html_404=True)
     try:
         result = discover_addresses(
-            config_toml_path=str(tmp_path / "missing.toml"),
             webui_base=base,
             devices=DEVICES,
         )
@@ -152,7 +119,6 @@ def test_json_empty_200_falls_back_to_html_scrape(tmp_path):
     srv, base = _serve({"/config.json": {"devices": []}, "/config": CONFIG_HTML})
     try:
         result = discover_addresses(
-            config_toml_path=str(tmp_path / "missing.toml"),
             webui_base=base,
             devices=DEVICES,
         )
@@ -161,20 +127,17 @@ def test_json_empty_200_falls_back_to_html_scrape(tmp_path):
     assert result == {1: "10.0.0.31", 2: "10.0.0.32"}
 
 
-def test_nothing_resolvable_returns_empty(tmp_path):
-    # No toml, no webui at all -> empty, no raise.
+def test_nothing_resolvable_returns_empty():
+    # webui down -> empty, no raise.
     result = discover_addresses(
-        config_toml_path=str(tmp_path / "missing.toml"),
         webui_base="http://127.0.0.1:1",  # nothing listening
         devices=DEVICES,
     )
     assert result == {}
 
 
-def test_no_webui_base_and_no_toml_returns_empty(tmp_path):
-    result = discover_addresses(
-        config_toml_path=None, webui_base=None, devices=DEVICES
-    )
+def test_no_webui_base_returns_empty():
+    result = discover_addresses(webui_base=None, devices=DEVICES)
     assert result == {}
 
 
@@ -189,7 +152,6 @@ def test_html_only_includes_matched_devices(tmp_path):
     srv, base = _serve({"/config": html}, html_404=True)
     try:
         result = discover_addresses(
-            config_toml_path=str(tmp_path / "missing.toml"),
             webui_base=base,
             devices=DEVICES,
         )
