@@ -1,16 +1,12 @@
 #!/command/with-contenv bashio
 # shellcheck shell=bash
 # ==============================================================================
-# init-config oneshot — runs once before the longruns.
+# init-config oneshot — runs once before the bridge.
 #
-# 1. Resolve the MQTT broker: when the mqtt_host option is blank, read the
-#    Supervisor MQTT service and export it as MQTT_* into the s6 container
-#    environment so the bridge longrun (with-contenv) picks it up. When the
-#    operator pinned mqtt_host, leave it to settings.load_settings.
-# 2. Validate that exactly one telescope source is configured (the bundled
-#    `scopes` list OR an external `alpaca_host`), failing fast otherwise.
-# 3. In bundled mode (alpaca_host blank), render seestar_alp's config.toml from
-#    the `scopes` option to the path settings.BUNDLED_CONFIG_TOML_PATH expects.
+# Resolve the MQTT broker: when the mqtt_host option is blank, read the
+# Supervisor MQTT service and export it as MQTT_* into the s6 container
+# environment so the bridge longrun (with-contenv) picks it up. When the
+# operator pinned mqtt_host, leave it to settings.load_settings.
 # ==============================================================================
 set -euo pipefail
 
@@ -18,26 +14,10 @@ set -euo pipefail
 # are exported into every `with-contenv` service that starts after this oneshot.
 readonly S6_ENV_DIR="/run/s6/container_environment"
 
-# Must match seestar_bridge.settings.BUNDLED_CONFIG_TOML_PATH and the bundled
-# driver's working layout. The init writes it; discovery + the driver read it.
-readonly CONFIG_TOML_PATH="/app/seestar_alp/device/config.toml"
-
-# Bundled seestar_alp binds Alpaca/imaging/web-UI to these ports inside the
-# container; mirrors settings.BUNDLED_ALPACA_HOST and config.yaml's ingress/ports.
-readonly ALPACA_BIND_ADDRESS="0.0.0.0"
-readonly ALPACA_PORT=5555
-readonly IMAGING_PORT=7556
-readonly WEBUI_PORT=5432
-
-# --- helpers ------------------------------------------------------------------
-
-# Persist a name/value into the s6 container environment for later services.
 write_env() {
     local name="${1}" value="${2}"
     printf '%s' "${value}" > "${S6_ENV_DIR}/${name}"
 }
-
-# --- 1. MQTT resolution -------------------------------------------------------
 
 if bashio::config.is_empty 'mqtt_host'; then
     if ! bashio::services.available 'mqtt'; then
@@ -56,151 +36,8 @@ else
     bashio::log.info "Using the operator-supplied MQTT host '$(bashio::config 'mqtt_host')'."
 fi
 
-# --- 2. Telescope source validation ------------------------------------------
-
-# bashio::config.has_value is false for both an absent key and an empty list
-# (an empty array yields no output), so it cleanly distinguishes "scopes set".
-has_scopes=false
-if bashio::config.has_value 'scopes'; then
-    has_scopes=true
-fi
-
-has_alpaca_host=false
 if bashio::config.has_value 'alpaca_host'; then
-    has_alpaca_host=true
-fi
-
-if [ "${has_scopes}" = true ] && [ "${has_alpaca_host}" = true ]; then
-    bashio::exit.nok \
-        "Both 'scopes' and 'alpaca_host' are set. Choose one: list your telescopes " \
-        "under 'scopes' to use the bundled driver, OR set 'alpaca_host' to reuse an " \
-        "existing seestar_alp (and leave 'scopes' empty)."
-fi
-
-if [ "${has_scopes}" = false ] && [ "${has_alpaca_host}" = false ]; then
-    bashio::exit.nok \
-        "No telescope configured. Add at least one entry under 'scopes' (bundled " \
-        "driver) or set 'alpaca_host' to an external seestar_alp (host:port)."
-fi
-
-# --- 3. Bundled-mode config.toml render --------------------------------------
-
-if [ "${has_alpaca_host}" = true ]; then
-    alpaca_host="$(bashio::config 'alpaca_host')"
-    bashio::log.info "External Alpaca driver '${alpaca_host}'; not rendering config.toml."
-
-    # The bundled seestar_alp never starts in external mode, so nothing serves
-    # the ingress port (5432). Instead the seestar-alp service slot runs a tiny
-    # info server that links to the operator's own SSC web UI. Compute that URL
-    # here and export it so the info server (with-contenv) can render the link.
-    # Host = alpaca_host with any ':port' stripped (its port is the Alpaca API
-    # port, not the web UI); web-UI port = the alpaca_webui_port option.
-    external_webui_host="${alpaca_host%%:*}"
-    external_webui_port="$(bashio::config 'alpaca_webui_port' "${WEBUI_PORT}")"
-    write_env 'SEESTAR_EXTERNAL_WEBUI_URL' \
-        "http://${external_webui_host}:${external_webui_port}"
-    bashio::log.info \
-        "External seestar_alp web UI at http://${external_webui_host}:${external_webui_port}."
-    exit 0
-fi
-
-bashio::log.info "Rendering bundled seestar_alp config.toml for $(bashio::config 'scopes | length') scope(s)."
-mkdir -p "$(dirname "${CONFIG_TOML_PATH}")"
-
-# seestar_alp reads [logging] log_level verbatim (uppercase, via
-# logging.getLevelName); mirror the bridge's log_level option so the bundled
-# driver honors it too. The HA-convention levels trace/notice/fatal have no
-# stdlib logging name, so map them onto the nearest real level (mirrors
-# settings.python_log_level) before uppercasing — otherwise getLevelName('TRACE')
-# misses and the driver degrades to its own default. Default to INFO when blank.
-log_level_raw="$(bashio::config 'log_level' 'info' | tr '[:upper:]' '[:lower:]')"
-case "${log_level_raw}" in
-    trace) log_level_raw='debug' ;;
-    notice) log_level_raw='info' ;;
-    fatal) log_level_raw='critical' ;;
-esac
-log_level_upper="$(printf '%s' "${log_level_raw}" | tr '[:lower:]' '[:upper:]')"
-# Firmware >= 7.18 interop auth key. The `interop_pem` option may hold the PEM
-# with real newlines, with literal "\n" sequences (the HA option field is
-# single-line), or base64 of the PEM. Materialize it to a root-only file on the
-# container's ephemeral /run (never /data, so it is not left on disk across
-# restarts) and point seestar_alp at it. The value is never logged.
-readonly INTEROP_PEM_PATH="/run/seestar/seestar_client_key.pem"
-has_interop_pem=false
-if bashio::config.has_value 'interop_pem'; then
-    pem="$(bashio::config 'interop_pem')"
-    pem="${pem//\\n/$'\n'}"
-    if [[ "${pem}" != *"-----BEGIN"* ]]; then
-        pem="$(printf '%s' "${pem}" | base64 -d 2>/dev/null || true)"
-    fi
-    if [[ "${pem}" != *"-----BEGIN"*"PRIVATE KEY-----"* ]]; then
-        bashio::exit.nok \
-            "The 'interop_pem' option is set but is not a PEM private key (nor base64 of one)."
-    fi
-    mkdir -p "$(dirname "${INTEROP_PEM_PATH}")"
-    (umask 077 && printf '%s\n' "${pem}" > "${INTEROP_PEM_PATH}")
-    unset pem
-    has_interop_pem=true
-    bashio::log.info "Interop PEM supplied; firmware 7.18+ authentication enabled."
+    bashio::log.info "Using the seestar_alp at '$(bashio::config 'alpaca_host')'."
 else
-    bashio::log.warning \
-        "No interop_pem set: on firmware >= 7.18 device state and all controls will be refused."
+    bashio::log.info "alpaca_host is blank: the bridge will look for the seestar_alp add-on."
 fi
-
-{
-    # Bind to all interfaces so the bridge reaches Alpaca by container DNS and
-    # the imaging/web-UI ports are reachable through ingress + the published port.
-    echo "[network]"
-    echo "ip_address = '${ALPACA_BIND_ADDRESS}'"
-    echo "port = ${ALPACA_PORT}"
-    echo "imgport = ${IMAGING_PORT}"
-    echo ""
-    echo "[webui_settings]"
-    echo "uiport = ${WEBUI_PORT}"
-    echo ""
-    echo "[seestar_initialization]"
-    # Parity with the standalone deployment (upstream defaults this to true).
-    echo "save_all_frames = false"
-    if [ "${has_interop_pem}" = true ]; then
-        echo "interop_pem = '${INTEROP_PEM_PATH}'"
-    fi
-    echo ""
-    # Surface the driver's logs in the add-on log stream (default is a file) and
-    # honor the operator's log_level (uppercase, the form seestar_alp expects).
-    echo "[logging]"
-    echo "log_to_stdout = true"
-    echo "log_level = '${log_level_upper}'"
-} > "${CONFIG_TOML_PATH}"
-
-# config.toml holds only scope names + LAN IPs (never secrets — those live in
-# /run/s6/container_environment). Keep it readable by the service user only.
-chmod 0640 "${CONFIG_TOML_PATH}"
-
-# Escape backslashes and double-quotes so an operator-supplied value can't break
-# out of the TOML basic string it is embedded in.
-toml_escape() {
-    local value="${1}"
-    value="${value//\\/\\\\}"
-    value="${value//\"/\\\"}"
-    printf '%s' "${value}"
-}
-
-# One [[seestars]] block per configured scope. device_num is 1-based and stable
-# across restarts; it is the Alpaca DeviceNumber the bridge enumerates and the
-# bridge's stable device id is the slug of `name` (never the rotating UniqueID).
-device_num=1
-for index in $(bashio::config 'scopes|keys'); do
-    name="$(bashio::config "scopes[${index}].name")"
-    host="$(bashio::config "scopes[${index}].host")"
-    {
-        echo ""
-        echo "[[seestars]]"
-        echo "name = \"$(toml_escape "${name}")\""
-        echo "ip_address = \"$(toml_escape "${host}")\""
-        echo "device_num = ${device_num}"
-    } >> "${CONFIG_TOML_PATH}"
-    bashio::log.info "  scope ${device_num}: '${name}' -> ${host}"
-    device_num=$((device_num + 1))
-done
-
-bashio::log.info "Wrote ${CONFIG_TOML_PATH}."

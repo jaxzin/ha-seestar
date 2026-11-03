@@ -1,10 +1,11 @@
 """Orchestrator: enumerate scopes, publish discovery, spawn a worker per scope.
 
 ``main`` wires the building blocks: load :class:`~seestar_bridge.settings.Settings`
-from the add-on options + environment, build and connect one shared MQTT client,
-enumerate the configured telescopes via Alpaca, resolve each scope's own HTTP
-address (preview only) via the 3-tier discovery, publish MQTT discovery for each
-as its own HA device, then run one :class:`~seestar_bridge.scope.ScopeWorker`
+from the add-on options + environment, find the seestar_alp Alpaca endpoint when
+``alpaca_host`` is blank (:mod:`~seestar_bridge.alpaca_discovery`), build and
+connect one shared MQTT client, enumerate the configured telescopes via Alpaca,
+resolve each scope's own HTTP address (preview only), publish MQTT discovery for
+each as its own HA device, then run one :class:`~seestar_bridge.scope.ScopeWorker`
 per scope on its own thread.
 
 The scope→worker wiring is factored into :func:`build_workers` so it can be
@@ -20,11 +21,12 @@ import threading
 import time
 
 from .alpaca import Alpaca
+from .alpaca_discovery import find_alpaca_endpoint
 from .discovery import discover_addresses
 from .entities import slug
 from .mqtt import COMMAND_QOS, build_client, set_router
 from .scope import ScopeWorker
-from .settings import Settings, load_settings, python_log_level
+from .settings import Settings, load_settings, python_log_level, with_alpaca_endpoint
 
 _log = logging.getLogger(__name__)
 
@@ -34,12 +36,10 @@ _DEVICE_NUMBER_KEY = "DeviceNumber"
 _MQTT_KEEPALIVE_SEC = 60
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
-#: In bundled mode the bridge and the seestar_alp driver start concurrently under
-#: s6, so the first ``configureddevices`` enumeration can hit a not-yet-bound
-#: :5555 and raise ConnectionRefused. Retry the enumeration on connection errors
-#: with a bounded backoff rather than crash-looping the always-on bridge. We do
-#: NOT add a hard s6 bridge->seestar-alp dependency, which would couple the bridge
-#: to the conditionally-downed driver.
+#: The driver may be restarting (or not have bound :5555 yet) when the bridge
+#: starts, so the first ``configureddevices`` enumeration can raise
+#: ConnectionRefused. Retry on connection errors with a bounded backoff rather
+#: than crash-looping the always-on bridge.
 _ALPACA_ENUMERATE_RETRY_SEC = 3
 _ALPACA_ENUMERATE_TIMEOUT_SEC = 60
 
@@ -93,7 +93,7 @@ def enumerate_devices(
 ) -> list[dict]:
     """Enumerate Alpaca devices, retrying on connection errors within a window.
 
-    In bundled mode the driver may not have bound :5555 yet when the bridge starts,
+    The driver may not have bound :5555 yet when the bridge starts,
     so :meth:`Alpaca.configured_devices` can raise ``ConnectionRefused`` (surfaced
     as ``URLError``, an ``OSError`` subclass). Retry every ``retry_sec`` until the
     driver answers or ``timeout_sec`` elapses, logging at info instead of crashing
@@ -124,7 +124,6 @@ def build_workers(alpaca, settings: Settings, mqtt_client) -> list[ScopeWorker]:
     devices = enumerate_devices(alpaca)
     device_ids = assign_device_ids(devices)
     addresses = discover_addresses(
-        config_toml_path=settings.config_toml_path,
         webui_base=settings.webui_base,
         devices=devices,
     )
@@ -199,6 +198,11 @@ def main() -> None:
     # instead of silently degrading to INFO.
     level = getattr(logging, python_log_level(settings.log_level), logging.INFO)
     logging.basicConfig(level=level, format=_LOG_FORMAT)
+
+    if settings.alpaca_base is None:
+        # alpaca_host blank: find the seestar_alp (add-on or LAN instance).
+        host_port = find_alpaca_endpoint(supervisor_token=os.environ.get("SUPERVISOR_TOKEN"))
+        settings = with_alpaca_endpoint(settings, host_port)
 
     # Device 0 is a placeholder for the management enumeration call; per-scope
     # Alpaca clients (bound to the real device numbers) are built in build_workers.

@@ -1,16 +1,16 @@
 # Home Assistant app manifest for "Seestar for Home Assistant".
 #
-# Bundles the seestar_alp Alpaca driver + the seestar_bridge telemetry publisher
-# in one container (two s6-supervised processes). Options below drive MQTT
-# resolution, the conditional bundled driver, and per-scope discovery; their keys
-# match seestar_bridge.settings.load_settings verbatim. The Supervisor reads the
-# image from GHCR ({arch} is substituted per architecture).
+# The seestar_bridge telemetry publisher: it reads a seestar_alp Alpaca driver
+# (the seestar_alp add-on, found automatically, or your own via alpaca_host) and
+# publishes MQTT discovery. Option keys match seestar_bridge.settings.load_settings
+# verbatim. The Supervisor reads the image from GHCR ({arch} is substituted per
+# architecture).
 name: Seestar for Home Assistant
 slug: seestar
-version: "1.0.7"
+version: "1.1.0"
 description: >-
-  Live Seestar imaging telemetry + a stacked-image preview in Home Assistant via
-  MQTT discovery. Bundles the seestar_alp driver, or reuses your own.
+  Live Seestar imaging telemetry, a stacked-image preview and controls in Home
+  Assistant via MQTT discovery. Pairs with the seestar_alp add-on.
 url: https://github.com/jaxzin/ha-seestar
 arch:
   - aarch64
@@ -20,18 +20,8 @@ arch:
 # must be disabled (required for s6 v3 or the app won't start).
 init: false
 
-# Web UI: the bundled seestar_alp SSC interface, surfaced in the HA sidebar.
-ingress: true
-ingress_port: 5432
-
-# Imaging API port the scope streams stacked frames on; published so an external
-# client can reach it. null = mapped to a host port the Supervisor chooses.
-ports:
-  "7556/tcp": null
-ports_description:
-  "7556/tcp": seestar_alp imaging API (bundled mode)
-
-# bashio reads the add-on config + the mqtt service via the Supervisor API.
+# bashio reads the add-on config + the mqtt service via the Supervisor API; the
+# bridge reads the add-on list (/supervisor/info) to find the seestar_alp add-on.
 hassio_api: true
 
 # Resolve the broker from the Supervisor MQTT service when mqtt_host is blank.
@@ -42,7 +32,6 @@ services:
 image: ghcr.io/jaxzin/ha-seestar-{arch}
 
 options:
-  scopes: []
   alpaca_host: ""
   alpaca_webui_port: 5432
   imaging_port: 7556
@@ -55,17 +44,12 @@ options:
   event_poll_sec: 10
   state_poll_sec: 30
   preview_max_px: 1280
-  interop_pem: ""
   log_level: info
 
 schema:
-  # Bundled mode only: one HA device per entry; seeds seestar_alp's config.toml.
-  scopes:
-    - name: str
-      host: str
-  # Blank = bundled driver; else host:port of your own seestar_alp.
+  # Blank = find the seestar_alp add-on automatically; else host:port of your own.
   alpaca_host: str?
-  # External mode: the seestar_alp web-UI port discovery reads /config from.
+  # The seestar_alp web-UI port the preview address is read from (/config.json).
   alpaca_webui_port: port
   # seestar_alp's imaging server on the Alpaca host (the live /vid camera).
   imaging_port: port
@@ -79,6 +63,4 @@ schema:
   event_poll_sec: int(1,3600)
   state_poll_sec: int(1,3600)
   preview_max_px: int(256,4096)
-  # Bundled mode: firmware >= 7.18 interop key (PEM, "\n"-escaped PEM, or base64).
-  interop_pem: password?
   log_level: list(trace|debug|info|notice|warning|error|fatal)

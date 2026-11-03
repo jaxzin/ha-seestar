@@ -2,18 +2,11 @@ Seestar for Home Assistant
 Copyright 2026 Brian R. Jackson
 Licensed under the Apache License, Version 2.0.
 
-This app bundles the seestar_alp Alpaca driver at arm's length (a separate
-process reached over the Alpaca HTTP socket):
+This app is a client of the seestar_alp Alpaca driver, which it reaches over the
+network (the Alpaca HTTP API) and does not include:
 
   seestar_alp — Copyright (c) 2024 Kai Yung / smart-underworld — GPL-3.0
   https://github.com/smart-underworld/seestar_alp
 
-seestar_alp in turn incorporates:
-
-  AlpacaDevice — Copyright (c) Bob Denny / ASCOM Initiative — MIT
-  PyIndi       — BSD-3-Clause
-
-The full license texts for all of the above ship inside the built image at
-/app/seestar_alp/LICENSE*.txt (LICENSE.txt plus LICENSE-Seestar_Alp.txt,
-LICENSE-AlpacaDevice.txt, and LICENSE-PyIndi.txt), preserved as-is from the
-pinned upstream tag. See THIRD_PARTY_LICENSES.md for the source-tree summary.
+seestar_alp is packaged as a separate Home Assistant add-on at
+https://github.com/jaxzin/ha_seestar_alp (GPL-3.0).

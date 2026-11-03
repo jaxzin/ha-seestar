@@ -155,7 +155,6 @@ def _settings(alpaca_base):
     return Settings(
         alpaca_base=alpaca_base,
         webui_base=None,
-        config_toml_path=None,
         discovery_prefix="homeassistant",
         event_poll_sec=10,
         state_poll_sec=30,

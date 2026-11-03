@@ -2,8 +2,7 @@
 # CI matrix in .github/workflows/build.yml) passes the matching entry as the
 # BUILD_FROM build-arg the Dockerfile's `ARG BUILD_FROM` / `FROM ${BUILD_FROM}`
 # consume. Home Assistant's base-debian images already bundle s6-overlay v3 +
-# bashio. Debian over Alpine because opencv-python has no musllinux wheels;
-# trixie over bookworm because trixie's Python 3.13 satisfies the bridge's
+# bashio. Trixie because its Python 3.13 satisfies the bridge's
 # requires-python >=3.12 (bookworm ships 3.11).
 build_from:
   aarch64: ghcr.io/home-assistant/aarch64-base-debian:trixie-2026.06.1

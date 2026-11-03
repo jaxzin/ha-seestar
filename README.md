@@ -15,30 +15,32 @@ It also drives the scope: HA-driven **control** (sessions, goto, saved plans, se
 
 ## What it is
 
-A single HA app that bundles everything you need:
-
-- the [seestar_alp](https://github.com/smart-underworld/seestar_alp) ASCOM Alpaca
-  driver (started for you, or reuse one you already run), and
-- a Python telemetry **bridge** that taps the driver's event stream, computes
-  Alt/Az, pulls the stacked preview image, and publishes MQTT discovery.
+A Python telemetry **bridge**, packaged as an HA app, that reads the
+[seestar_alp](https://github.com/smart-underworld/seestar_alp) ASCOM Alpaca
+driver, taps its event stream, computes Alt/Az, pulls the stacked preview image,
+and publishes MQTT discovery. The driver runs as its own add-on,
+[**seestar_alp**](https://github.com/jaxzin/ha_seestar_alp), which the bridge
+finds automatically; or point it at a seestar_alp you already run.
 
 It runs zero-config against the official **Mosquitto** add-on and supports
 **multiple scopes** (one HA device each).
 
 ## Architecture
 
-One container, two [s6](https://github.com/just-containers/s6-overlay)-supervised
-processes:
+Two add-ons, two containers:
 
-- **seestar_alp** — the ASCOM Alpaca driver. Started only in *bundled* mode.
-- **seestar_bridge** — the telemetry bridge (always running). It enumerates
-  devices via Alpaca, taps the non-blocking event stream, computes Alt/Az,
-  discovers each scope's address for the preview, and publishes MQTT discovery —
-  one HA device per scope, namespaced by a stable slug of the scope name.
+- **seestar_alp** ([jaxzin/ha_seestar_alp](https://github.com/jaxzin/ha_seestar_alp))
+  — the ASCOM Alpaca driver and its SSC web UI. It owns the scope list and the
+  firmware 7.18+ auth key.
+- **seestar_bridge** (this app) — finds the driver by ASCOM Alpaca discovery (or
+  `alpaca_host`), enumerates devices via Alpaca, taps the non-blocking event
+  stream, computes Alt/Az, discovers each scope's address for the preview, and
+  publishes MQTT discovery — one HA device per scope, namespaced by a stable slug
+  of the scope name.
 
 ```
-Seestar(s) ──Alpaca──> seestar_alp ──event tap──> seestar_bridge ──MQTT discovery──> Home Assistant
-     └──────────────── stacked .jpg (preview) ───────────────────┘
+Seestar(s) ──> seestar_alp add-on ──Alpaca──> seestar_bridge ──MQTT discovery──> Home Assistant
+     └──────────────── stacked .jpg (preview) ──────┘
 ```
 
 ## Getting started (Home Assistant OS / Supervised)
@@ -63,17 +65,19 @@ version:
 
 **Then:**
 
-1. Add this repository — **Settings → Add-ons → Add-on Store → ⋮ →
+1. Add both repositories — **Settings → Add-ons → Add-on Store → ⋮ →
    Repositories**:
 
    ```
+   https://github.com/jaxzin/ha_seestar_alp
    https://github.com/jaxzin/ha-seestar
    ```
 
-2. Install **Seestar for Home Assistant**.
-3. On the **Configuration** tab, add your scope under **Telescopes** (name + LAN
-   IP) for **bundled** mode, or set **External Alpaca driver** (`alpaca_host`) to
-   reuse your own seestar_alp. **Start** the app.
+2. Install **Seestar Alpaca driver (seestar_alp)**, add your scope under
+   **Telescopes** (name + LAN IP) and, on firmware 7.18+, the interop key, then
+   **Start** it.
+3. Install **Seestar for Home Assistant** and **Start** it. Leave `alpaca_host`
+   blank to use the seestar_alp add-on, or set it to reuse your own seestar_alp.
 4. Watch the **Log** tab for the broker connection and `discovered` lines, then
    find the device under **Settings → Devices & Services → MQTT**.
 
@@ -84,17 +88,16 @@ preview work without an auth key, but device-state fields and controls need a
 challenge-response interop key configured in seestar_alp — see
 [Firmware 7.18+ authentication](seestar/DOCS.md#firmware-718-authentication).
 
-See **[seestar/DOCS.md](seestar/DOCS.md)** for the full options reference, the
-bundled-vs-external choice, the Mosquitto zero-config note, and troubleshooting.
+See **[seestar/DOCS.md](seestar/DOCS.md)** for the full options reference, how
+the driver is found, the Mosquitto zero-config note, and troubleshooting.
 
 ## Install (HA Container / Core, or a separate host)
 
 If you run Home Assistant **Container** or **Core**, or want the bridge on a
 separate machine (e.g. a dedicated Raspberry Pi), there's no Supervisor — use the
-[`docker-compose.yml`](docker-compose.yml) path. It runs the same bridge (and, in
-bundled mode, seestar_alp) from the same image, with MQTT and scope config
-provided explicitly. The compose file and the [`examples/`](examples/) samples are
-commented end-to-end.
+[`docker-compose.yml`](docker-compose.yml) path. It runs the bridge plus a
+seestar_alp service, with MQTT and scope config provided explicitly. The compose
+file and the [`examples/`](examples/) samples are commented end-to-end.
 
 ## Dashboard card
 
@@ -113,8 +116,7 @@ adapt the prefix to your scope's name and read the exact IDs off the device page
 ## Licensing
 
 This project's code is licensed under the
-[Apache License, Version 2.0](LICENSE). The bundled `seestar_alp` driver is
-licensed under **GPL-3.0** and is included at arm's length (we talk to it over the
-Alpaca HTTP socket, as a separate process); see [NOTICE](NOTICE) and
-[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for attribution and the
-preserved component licenses.
+[Apache License, Version 2.0](LICENSE). It does not include `seestar_alp`
+(GPL-3.0), which runs as a separate add-on or process that the bridge reaches over
+the Alpaca HTTP API; see [NOTICE](NOTICE) and
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).

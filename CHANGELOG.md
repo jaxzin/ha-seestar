@@ -31,15 +31,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blip left the Last-Will `offline` retained, greying out every control entity
   until the add-on restarted.
 
-### Changed (bundled mode)
+### Changed (breaking)
 
-- Bundled seestar_alp now builds from the `jaxzin/seestar_alp` fork tag
-  `deploy-2026.07.17` (the build the standalone heimdall deployment ran) instead
-  of upstream `v3.2.2`.
-- New `interop_pem` option (bundled mode): firmware >= 7.18 auth key, written to
-  a root-only ephemeral file and referenced from the generated `config.toml`.
-  The rendered config also sets `save_all_frames = false` to match the
-  standalone deployment.
+- The seestar_alp driver is no longer bundled. It runs as its own add-on,
+  **Seestar Alpaca driver (seestar_alp)** from
+  [jaxzin/ha_seestar_alp](https://github.com/jaxzin/ha_seestar_alp), which now
+  owns the scope list (`scopes`), the firmware 7.18+ key (`interop_pem`) and the
+  SSC web UI. This app is the bridge only: the `scopes` and `interop_pem` options,
+  the ingress panel and the published imaging port are gone.
+- With `alpaca_host` blank the bridge finds the driver itself: ASCOM Alpaca UDP
+  discovery plus the Supervisor add-on list (`*_seestar_alp`), accepting only an
+  endpoint whose telescope answers seestar_alp's `get_event_state`. Exactly one
+  match is used; more than one asks you to set `alpaca_host`.
+- **Moving from bundled mode:** install the seestar_alp add-on, copy your
+  `scopes` (keep the same scope name, so the HA device and entity IDs stay the
+  same) and `interop_pem` into it, start it, then update this app. Run only one
+  driver against a scope at a time.
 
 ### Changed
 

@@ -2,8 +2,9 @@
 
 Live Seestar imaging telemetry and a stacked-image preview in Home Assistant,
 published as auto-discovered MQTT entities — one HA device per telescope. The app
-bundles the [seestar_alp](https://github.com/smart-underworld/seestar_alp) Alpaca
-driver, or reuses one you already run.
+reads your scope through the [seestar_alp](https://github.com/smart-underworld/seestar_alp)
+Alpaca driver: the **seestar_alp add-on** (found automatically), or one you
+already run.
 
 ## Getting started
 
@@ -34,26 +35,31 @@ Tick all of these off first — the install assumes them:
   add-on. A DHCP reservation for the scope is worth setting so the address
   doesn't move.
 
-### Install the add-on
+### Install the add-ons
+
+Two add-ons work together: **Seestar Alpaca driver (seestar_alp)** talks to the
+telescope, and **Seestar for Home Assistant** (this app) turns it into Home
+Assistant entities.
 
 1. In Home Assistant, go to **Settings → Add-ons → Add-on Store** (on newer
    builds, **Settings → Apps**), open the **⋮** menu (top right), choose
-   **Repositories**, and add:
+   **Repositories**, and add both:
 
    ```
+   https://github.com/jaxzin/ha_seestar_alp
    https://github.com/jaxzin/ha-seestar
    ```
 
-2. The **Seestar for Home Assistant** app appears in the store. Install it.
-3. Open the **Configuration** tab and tell it where your scope is. Most people
-   want **bundled** mode: leave **External Alpaca driver** (`alpaca_host`) blank
-   and add your telescope under **Telescopes** — a name and the scope's LAN IP
-   from the checklist above. If you already run seestar_alp elsewhere, use
-   **external** mode instead — see
-   [Bundled vs external driver](#bundled-vs-external-driver). Then **Start** the
-   app.
-4. Open the **Log** tab to watch it connect, enumerate the scope, and publish
-   MQTT discovery.
+2. Install **Seestar Alpaca driver (seestar_alp)**. On its **Configuration** tab,
+   add your telescope under **Telescopes** (a name and the scope's LAN IP from the
+   checklist above) and, on firmware 7.18+, the interop key. **Start** it. Its
+   own [documentation](https://github.com/jaxzin/ha_seestar_alp/blob/main/seestar_alp/DOCS.md)
+   covers the options.
+3. Install **Seestar for Home Assistant** and **Start** it. Leave **seestar_alp
+   driver** (`alpaca_host`) blank: it finds the driver add-on by itself (see
+   [Finding the seestar_alp driver](#finding-the-seestar_alp-driver)).
+4. Open its **Log** tab to watch it find the driver, enumerate the scope, and
+   publish MQTT discovery.
 
 ### Verify it worked
 
@@ -97,34 +103,35 @@ needed). Any `mqtt_host` you set overrides the Supervisor service. If MQTT can b
 resolved from neither the Supervisor nor the options, the app fails fast with a
 message telling you to install Mosquitto or set `mqtt_host`.
 
-## Bundled vs external driver
+## Finding the seestar_alp driver
 
-The app talks to your telescope through the seestar_alp Alpaca driver. You choose
-where that driver runs with the single `alpaca_host` option:
+With `alpaca_host` blank (the default), the app looks for the driver at startup,
+retrying for up to three minutes while the driver add-on starts:
 
-| | `alpaca_host` blank (default) — **bundled** | `alpaca_host` set — **external** |
-|---|---|---|
-| seestar_alp | runs **inside this app** | you run it yourself elsewhere |
-| Scope list | the app's **Telescopes** (`scopes`) option seeds it | already configured on your instance |
-| Web UI | the seestar_alp **SSC web UI**, in the HA sidebar (ingress) | open your own instance's UI |
-| Preview address | read from the bundled `config.toml` | read from your instance's `/config.json` (or `/config` page) |
+1. **ASCOM Alpaca discovery** — a UDP broadcast on port 32227 that every Alpaca
+   server answers. This finds the seestar_alp add-on over the Supervisor's
+   internal network.
+2. **The Supervisor add-on list** — a started add-on whose slug ends in
+   `_seestar_alp`, from any repository. When it is also the one that answered
+   discovery, the app uses the add-on's stable internal hostname instead of its
+   container IP.
 
-- **Bundled** (most users): leave `alpaca_host` blank and list your scope(s) under
-  **Telescopes**. The app starts seestar_alp for you and writes its config.
-- **External**: if you already run seestar_alp on the network, set
-  `alpaca_host` to its `host:port` (e.g. `192.168.1.50:5555`) and leave
-  **Telescopes** empty — that instance already knows your scopes.
+A server only counts if its Alpaca API has a telescope that answers seestar_alp's
+`get_event_state` action. Other Alpaca drivers on the network are ignored. If
+exactly one qualifies, the app uses it and logs which; **if more than one
+qualifies, it stops and asks you to set `alpaca_host`**.
 
-Setting **both** `scopes` and `alpaca_host` is rejected at startup; so is setting
-**neither**.
+**Your own seestar_alp** (another machine, a different port, or a different
+broadcast domain): set `alpaca_host` to its `host:port` (e.g.
+`192.168.1.50:5555`). Discovery is skipped. Don't run two drivers against the
+same scope: a Seestar serves its command channel to one client at a time.
 
 ## Options reference
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `scopes` | list of `{name, host}` | `[]` | **Bundled mode only.** One entry per telescope. `name` is the HA device name (see the [naming caveat](#renaming-a-scope-creates-a-new-device)); `host` is the scope's LAN IP or hostname. Each becomes its own HA device. Leave empty in external mode. |
-| `alpaca_host` | string | `""` | Blank = run the bundled driver. Set to `host:port` of your own seestar_alp to reuse it (and leave `scopes` empty). |
-| `alpaca_webui_port` | port | `5432` | **External mode only.** The port your seestar_alp serves its config on, used to look up each scope's address for the preview. |
+| `alpaca_host` | string | `""` | Blank = find the seestar_alp add-on automatically (see [Finding the seestar_alp driver](#finding-the-seestar_alp-driver)). Set to `host:port` of a specific seestar_alp to use that one. |
+| `alpaca_webui_port` | port | `5432` | The port the seestar_alp web UI is served on, where each scope's address is read (`/config.json`) for the preview. Change only for a seestar_alp rebound elsewhere. |
 | `imaging_port` | port | `7556` | Port of seestar_alp's imaging server on the Alpaca host, where the Live view camera grabs its `/vid` MJPEG frames. Change only for an external seestar_alp bound to a non-stock imaging port. |
 | `mqtt_host` | string | `""` | Blank = use the Mosquitto add-on via the Supervisor. Set to override with another broker. |
 | `mqtt_port` | port | `1883` | Ignored while `mqtt_host` is blank (the Supervisor service supplies the port). Set `8883` for a TLS broker when overriding `mqtt_host`. |
@@ -135,8 +142,7 @@ Setting **both** `scopes` and `alpaca_host` is rejected at startup; so is settin
 | `event_poll_sec` | int (1–3600) | `10` | How often to poll the fast Alpaca event stream for imaging telemetry. Lower is more responsive; higher is gentler on the driver. |
 | `state_poll_sec` | int (1–3600) | `30` | How often to poll the slower device-state call (mount mode, focuser, battery, firmware). These fields refresh only at idle gaps during a capture — see [Behavior during active imaging](#known-caveats). |
 | `preview_max_px` | int (256–4096) | `1280` | Longest-edge limit for the stacked preview before publishing; larger previews are downscaled to this. |
-| `interop_pem` | password | `""` | **Bundled mode only.** Firmware ≥ 7.18 interop auth key (RSA private key). Paste the PEM, the PEM with literal `\n` instead of newlines (the field is single-line), or its base64. It is written to a root-only file on the container's ephemeral filesystem and referenced from the generated `config.toml`; it is never logged. Blank = unauthenticated (see [Firmware 7.18+ authentication](#firmware-718-authentication)). In external mode configure the key on your own seestar_alp instead. |
-| `log_level` | enum | `info` | Verbosity of the bridge and bundled driver. One of `trace`, `debug`, `info`, `notice`, `warning`, `error`, `fatal`. Use `debug` or `trace` to diagnose a connection problem. |
+| `log_level` | enum | `info` | Verbosity of the bridge. One of `trace`, `debug`, `info`, `notice`, `warning`, `error`, `fatal`. Use `debug` or `trace` to diagnose a connection problem. |
 
 ## What gets published
 
@@ -303,20 +309,18 @@ against seestar_alp:
 ## Running without the Supervisor
 
 For **Home Assistant Container / Core** or a **separate host**, the repo ships a
-[`docker-compose.yml`](../docker-compose.yml) that runs the same bridge (and, in
-bundled mode, seestar_alp) from the same image. There is no Supervisor there, so:
+[`docker-compose.yml`](../docker-compose.yml) that runs the bridge plus a
+seestar_alp service. There is no Supervisor there, so:
 
 - **MQTT must be provided explicitly** via the `MQTT_HOST` / `MQTT_PORT` /
   `MQTT_USERNAME` / `MQTT_PASSWORD` / `MQTT_SSL` environment variables (there is
   no Mosquitto add-on to borrow). These are the **only** environment variables
   the bridge reads ([sample `.env`](../examples/env.sample)).
-- **Scopes** are configured in seestar_alp directly: in bundled mode via a
-  bind-mounted `config.toml` ([sample](../examples/config.toml.sample)); in
-  external mode by pointing `alpaca_host` at your existing instance.
+- **Scopes** are configured in seestar_alp directly, via a bind-mounted
+  `config.toml` ([sample](../examples/config.toml.sample)).
 - The bridge's **non-MQTT options live in `/data/options.json`**
-  ([sample](../examples/options.json.sample)) — `alpaca_host`,
-  `alpaca_webui_port`, and the tuning knobs are set there, **not** as environment
-  variables.
+  ([sample](../examples/options.json.sample)). The sample sets `alpaca_host` to
+  the `seestar_alp` service by name, so the bridge doesn't depend on discovery.
 
 > **Create the bind-mount source files before the first `docker compose up`.**
 > Copy them from `examples/`:
@@ -331,20 +335,16 @@ bundled mode, seestar_alp) from the same image. There is no Supervisor there, so
 > **directory**, which silently breaks the container (the process tries to read a
 > directory as its config file). Create the files first.
 
-> **`aarch64` hosts must set `ARCH`.** The image is published per-arch and `ARCH`
-> defaults to `amd64`. On 64-bit ARM (e.g. a dedicated Raspberry Pi) set
+> **`aarch64` hosts must set `ARCH`.** The bridge image is published per-arch and
+> `ARCH` defaults to `amd64`. On 64-bit ARM (e.g. a dedicated Raspberry Pi) set
 > `ARCH=aarch64` in `.env` (see [sample](../examples/env.sample)) or you will pull
 > the amd64 image and it won't run.
 
-Under compose, even the **bundled** setup runs the bridge in *external* mode:
-`options.json` sets `alpaca_host: "seestar_alp:5555"`, so the bridge resolves each
-scope's preview address from the **seestar_alp** service's `/config.json` (or the
-`/config` HTML page on the pinned `v3.2.2`) web UI on port **5432** — which is why
-the `seestar_alp` service publishes `5432`. It does **not** read the bind-mounted
-`config.toml` for the preview address (only seestar_alp reads `config.toml`).
-Telemetry is unaffected — it never needs the preview address.
-
-The compose file is commented top-to-bottom with the bundled-vs-external choice.
+The `seestar_alp` service is built from seestar_alp's own `docker/Dockerfile` at
+the pinned tag. The bridge reads each scope's preview address from that service's
+`/config.json` on port **5432**. Telemetry never needs the preview address. To use
+a seestar_alp you already run instead, delete the `seestar_alp` service and point
+`alpaca_host` at yours.
 
 ## Troubleshooting
 
@@ -369,11 +369,14 @@ calls this out and tells you which prefix to replace.
 - Confirm MQTT is connected: the **Log** tab should show the broker connection and
   "discovered" lines. If it complains about MQTT, install the Mosquitto add-on or
   set `mqtt_host`.
-- Confirm the scope is reachable: the bridge enumerates scopes from seestar_alp,
-  so in bundled mode the scope `host` must be correct and on the LAN. A Seestar in
-  its default **AP mode** is its own Wi-Fi hotspot and is **not reachable** from
-  Home Assistant — it must first be joined to your home Wi-Fi in **station mode**
-  via the Seestar app, on the same subnet as HA (see
+- Confirm the app found the driver: the **Log** tab names the seestar_alp it uses,
+  or says none was found. Check the seestar_alp add-on is started, or set
+  `alpaca_host`.
+- Confirm the scope is reachable from the driver: the scope's `host` in the
+  seestar_alp add-on must be correct and on the LAN. A Seestar in its default
+  **AP mode** is its own Wi-Fi hotspot and is **not reachable** from Home
+  Assistant — it must first be joined to your home Wi-Fi in **station mode** via
+  the Seestar app, on the same subnet as HA (see
   [Before you begin](#before-you-begin)).
 - Check Home Assistant's MQTT integration `discovery_prefix` matches the
   `discovery_prefix` option (both default to `homeassistant`).
@@ -400,46 +403,35 @@ updating.
 
 These are deliberate v1 limitations, documented so they don't surprise you:
 
-1. **Bundled seestar_alp is pinned to the `jaxzin/seestar_alp` fork tag
-   `deploy-2026.07.17`.** The fork is upstream `main` plus
-   [#749](https://github.com/smart-underworld/seestar_alp/pull/749)
-   (`/config.json`), [#750](https://github.com/smart-underworld/seestar_alp/pull/750)
-   (mount mode from `get_event_state`), threaded servers and non-fatal,
-   self-healing firmware ≥ 7.18 auth. Bundled mode reads the scope address
-   straight from `config.toml` inside the container. In **external** mode against
-   an older seestar_alp, the bridge falls back to scraping the `/config` HTML page
-   for the preview address; once you run a seestar_alp new enough to expose
-   `/config.json`, it uses that automatically.
-2. **seestar_alp's own dependencies are not hash-pinned.** They are installed from
-   the upstream `requirements.txt` at its pinned tag. The bridge's own
-   dependencies **are** hash-pinned (`--require-hashes`).
-3. **The base image is pinned by tag, not by digest.** The Dockerfile builds from
+1. **Older seestar_alp releases have no `/config.json`.** It arrived in upstream
+   [#749](https://github.com/smart-underworld/seestar_alp/pull/749). Against an
+   older seestar_alp the bridge falls back to scraping the `/config` HTML page for
+   the preview address.
+2. **The base image is pinned by tag, not by digest.** The Dockerfile builds from
    `ghcr.io/home-assistant/<arch>-base-debian:trixie-2026.06.1` (a tag), so a
    rebuild could pick up an updated base under the same tag.
-4. **The bundled web UI / ingress is live in BUNDLED mode only.** The HA sidebar
-   ingress surfaces the *bundled* seestar_alp SSC web UI. In **external** mode the
-   app does not start a driver, so the **Open Web UI** panel instead shows a small
-   info page that links out to your own seestar_alp instance's web UI (at
-   `alpaca_host`'s host on `alpaca_webui_port`) — open it directly there.
+3. **No web UI of its own.** The seestar_alp SSC web UI is in the seestar_alp
+   add-on's sidebar panel.
 
    <a id="renaming-a-scope-creates-a-new-device"></a>
 
-5. **A scope's name is identity-bearing.** The HA device id is derived from the
-   scope name, and HA derives entity IDs from it too, so **renaming a scope
+4. **A scope's name is identity-bearing.** The HA device id is derived from the
+   scope name you set in seestar_alp, and HA derives entity IDs from it too, so
+   **renaming a scope
    creates a new device with new entity IDs** — the old ones go stale. Pick a
    stable name up front; if you must rename, expect to re-point dashboards and
    automations at the new IDs.
 
    <a id="firmware-718-authentication"></a>
 
-6. **Firmware 7.18+ authentication.** The telemetry (~46 entities) and the
+5. **Firmware 7.18+ authentication.** The telemetry (~46 entities) and the
    stacked-image **preview** work with **no auth key** — they ride the scope's
    **event stream**, which is unauthenticated. But on **firmware ≥ 7.18** the
    scope gates its synchronous COMMAND channel behind a **challenge-response
    interop auth key**, so **device-state fields** (mount mode, focuser, battery,
    firmware, park/home, tracking) and **all** [Phase-2 controls](#controls-phase-2)
-   require that key to be configured **in seestar_alp**. In bundled mode, paste it
-   into the `interop_pem` option. Without it those entities
+   require that key to be configured **in seestar_alp** (the seestar_alp add-on's
+   `interop_pem` option). Without it those entities
    stay unknown and commands are refused by the scope, while telemetry and the
    preview keep working. Obtaining the key is not something this add-on ships —
    see the [seestar_alp project](https://github.com/smart-underworld/seestar_alp)
@@ -447,7 +439,7 @@ These are deliberate v1 limitations, documented so they don't surprise you:
 
    <a id="behavior-during-active-imaging"></a>
 
-7. **Behavior during active imaging.** During an exposure the scope firmware
+6. **Behavior during active imaging.** During an exposure the scope firmware
    **stalls synchronous `get_device_state` queries**, so the slower device-state
    fields (mount mode, focuser, battery, firmware, park/home, tracking) refresh
    only at the **idle gaps between frames** — not continuously. This is expected,
@@ -458,6 +450,6 @@ These are deliberate v1 limitations, documented so they don't surprise you:
 ## Licensing
 
 This app's code is licensed under the [Apache License, Version 2.0](../LICENSE).
-The bundled `seestar_alp` driver is GPL-3.0; see [NOTICE](../NOTICE) and
-[THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md) for attribution and the
-preserved component licenses.
+It does not include seestar_alp, which is GPL-3.0 and runs separately (the
+seestar_alp add-on, or your own instance); see [NOTICE](../NOTICE) and
+[THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md).

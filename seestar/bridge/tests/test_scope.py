@@ -301,7 +301,6 @@ def _cycle_settings():
     return Settings(
         alpaca_base="http://stub",
         webui_base=None,
-        config_toml_path=None,
         discovery_prefix="homeassistant",
         event_poll_sec=10,
         state_poll_sec=30,

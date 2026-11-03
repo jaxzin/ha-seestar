@@ -90,5 +90,4 @@ dependencies = [
 requires-dist = [
     { name = "paho-mqtt", specifier = "~=2.1" },
     { name = "pillow", specifier = "~=11.0" },
-    { name = "tomli", marker = "python_full_version < '3.11'", specifier = "~=2.0" },
 ]

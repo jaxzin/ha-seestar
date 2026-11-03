@@ -83,7 +83,6 @@ def _settings(alpaca_base):
     return Settings(
         alpaca_base=alpaca_base,
         webui_base=None,  # no preview discovery in this smoke; tests the telemetry path
-        config_toml_path=None,
         discovery_prefix="homeassistant",
         event_poll_sec=10,
         state_poll_sec=30,
@@ -204,7 +203,7 @@ class _FlakyAlpaca:
 
 
 def test_enumerate_devices_retries_then_recovers():
-    # Bundled cold-start: the driver hasn't bound :5555 yet, so the first
+    # Driver cold start: it hasn't bound :5555 yet, so the first
     # enumeration raises a connection error; the bounded retry recovers once the
     # driver answers, rather than crash-looping the always-on bridge.
     refused = urllib.error.URLError(ConnectionRefusedError("connection refused"))
