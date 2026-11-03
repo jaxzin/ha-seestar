@@ -214,6 +214,38 @@ change): `binary_sensor.seestar_for_home_assistant_running`,
 `sensor.seestar_for_home_assistant_{version,newest_version,cpu_percent,memory_percent}`,
 `switch.seestar_for_home_assistant`, `device_tracker.seestar`.
 
+## Executed 2026-11-03: what actually happened
+
+Cutover done in one session; verified live: `seestar/bridge/availability` and
+`seestar/seestar_s30_pro/availability` `online`, `connected` on, firmware /
+battery / mount mode populated (these need the authenticated command channel, so
+the PEM handshake worked), controls still OFF, live-view camera unavailable
+(expected: session not owned by the bridge).
+
+Corrections to the plan above:
+
+- **The auth stall had two causes, neither a competing client.** (1) The scope
+  was mid-stacking; the firmware stalls synchronous queries during an exposure
+  (known caveat), so `get_verify_str` timed out. (2) The standalone container
+  could never read its PEM: `secrets/seestar_client_key.pem` was mode 600 owned
+  by uid 1000 while the container ran as uid 1001 (`Permission denied`). The add-on
+  runs as root, so bundled mode does not have this problem.
+- **The add-on does not show the new version until the store reloads.** Call
+  `supervisor/api` `/store/reload` (POST), wait until it stops answering "Supervisor
+  is not ready", then `/addons/ff29c31e_seestar/update` (POST).
+- **Posting options does not restart the add-on**, and a restart issued while the
+  Supervisor is busy can be rejected silently. Check that the call returned
+  `"success": true`; a bundled add-on shows the "Simple Seestar Controller" page
+  through ingress, while an add-on still in external mode shows "External driver
+  mode".
+- **Logs are not reachable over the `supervisor/api` WebSocket** (text responses
+  fail). Verify through MQTT (retained topics under `seestar/#`) and HA entity
+  states instead; the SSC UI is reachable through an ingress session
+  (`/ingress/session` POST, then the `ingress_entry` path with
+  `Cookie: ingress_session=<session>`).
+- Port 7556 is not mapped to the host by default; the SSC UI's browser-side
+  preview needs it only if you open the UI from outside ingress.
+
 ## Out of scope
 
 `seestar-sync` (k3s, SMB, every 15 min) is unrelated and untouched. Renaming the
