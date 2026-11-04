@@ -148,10 +148,10 @@ them on when you are at the scope, and off afterwards. See
 
 **Experimental.** Tested with the Seestar S30 Pro only. On Home Assistant it has
 been run as a dry run: it starts, finds Mosquitto, sets up its archive under
-`/media` and publishes its device. Not yet confirmed from HA: reading the scope
-over SMB (TCP 445), a real copy, and an archive on network storage added under
-**Settings → System → Storage**. The scope needs a fixed IP, and a full library
-is hundreds of GB.
+`/media`, publishes its device and reads the scope's library over SMB (TCP 445).
+Not yet confirmed from HA: a real copy, freeing space on the scope, and an
+archive on network storage added under **Settings → System → Storage**. The
+scope needs a fixed IP, and a full library is hundreds of GB.
 
 > **Already run seestar-sync somewhere else** (Docker, Kubernetes, another
 > add-on)? Give this one its own `archive_dir` **and** its own
@@ -173,8 +173,10 @@ is hundreds of GB.
    logs, copying and deleting nothing) and **reclaim off** (it never deletes from
    the scope). With the MQTT options blank it uses Mosquitto and publishes a
    **Seestar Sync** device.
-4. Read its **Log** tab for a few runs, then turn **dry run** off to make real
-   copies. Deletion is still impossible until you turn reclaim on.
+4. Read its **Log** tab for a few runs. In dry run, **Files copied** and
+   **Bytes copied** show what a real run *would* copy, not files actually
+   copied. Then turn **dry run** off to make real copies. Deletion is still
+   impossible until you turn reclaim on.
 
 Run only one Seestar Sync per archive. Freeing space on the scope is a separate,
 deliberate step: read the safe first-run procedure in its
