@@ -983,3 +983,58 @@ def test_reading_taken_before_a_command_does_not_flip_the_echo_back():
     # the first reading taken after the command is authoritative: the scope ignored it
     worker._sync_switch_states({"dew_heater": False}, time.monotonic())
     assert _switch_states(mqtt, worker, "dew_heater_set") == ["ON", "OFF"]
+
+
+class _GatedMqtt(_RecordingMqtt):
+    """Holds ONE publish (made by ``gate_thread``) open until released.
+
+    The payload is recorded only AFTER the gate opens, i.e. it lands in
+    ``published`` at the moment it would reach the broker -- so the recorded order
+    is the order the broker would see.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.gate_thread = None
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def publish(self, topic, payload, retain=False):
+        if threading.current_thread() is self.gate_thread and not self.entered.is_set():
+            self.entered.set()
+            assert self.release.wait(5), "test never released the gated publish"
+        super().publish(topic, payload, retain)
+
+
+def test_command_landing_while_a_sync_is_publishing_is_not_overwritten():
+    """Race: sync passed its stamp check, a command echo lands, sync then publishes.
+
+    The sync thread is parked inside its publish (after it checked there was no
+    command). A command is then dispatched on another thread. The command must not
+    slip in between sync's check and publish: the final broker state has to be the
+    command's ON, not sync's stale OFF.
+    """
+    mqtt = _GatedMqtt()
+    worker = ScopeWorker(alpaca=_AcceptingAlpaca(), device=DEVICE, settings=None,
+                         mqtt_client=mqtt, scope_http_base=None)
+    worker.handle_command(f"{worker.base_topic}/cmd/controls_enabled", "ON")
+    mqtt.published.clear()
+
+    cycle_started = time.monotonic()
+    sync = threading.Thread(
+        target=lambda: worker._sync_switch_states({"dew_heater": False}, cycle_started))
+    mqtt.gate_thread = sync
+    sync.start()
+    assert mqtt.entered.wait(5), "sync never reached its publish"
+
+    command = threading.Thread(
+        target=worker.handle_command,
+        args=(f"{worker.base_topic}/cmd/dew_heater_set", "ON"))
+    command.start()
+    command.join(0.3)   # unserialized, the command finishes (publishing ON) right here
+    mqtt.release.set()
+    sync.join(5)
+    command.join(5)
+    assert not sync.is_alive() and not command.is_alive()
+
+    assert _switch_states(mqtt, worker, "dew_heater_set") == ["OFF", "ON"]

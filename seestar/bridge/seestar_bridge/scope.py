@@ -416,6 +416,11 @@ class ScopeWorker:
         # and when (time.monotonic) each switch last had a command echoed to it.
         self._switch_synced: dict[str, bool] = {}
         self._switch_commanded: dict[str, float] = {}
+        # Serializes "echo a command + stamp it" (MQTT thread) against "check the
+        # stamp + cache + publish a reading" (worker thread): without it a stale
+        # reading can pass the stamp check, lose the race to a command echo, and
+        # then overwrite that echo.
+        self._switch_lock = threading.Lock()
         # Last-known merged state snapshot (see the _CYCLE_FRESH_KEYS block):
         # seeded once from our own retained state topic at startup, then merged
         # set-when-present each cycle so a driver restart's sparse events never
@@ -908,12 +913,13 @@ class ScopeWorker:
         if result.status is DispatchStatus.OK:
             self._track_session_ownership(key)
             if self._control_is_stateful(key):
-                self._publish_control_state(key, payload)
-                # The echo may not be what the scope ends up doing: record when it
-                # was sent so the next reading TAKEN AFTER it re-mirrors the switch
-                # (even if it equals the previous one); a reading taken before it
-                # must not override the echo (_sync_switch_states).
-                self._switch_commanded[key] = time.monotonic()
+                with self._switch_lock:
+                    self._publish_control_state(key, payload)
+                    # The echo may not be what the scope ends up doing: record when
+                    # it was sent so the next reading TAKEN AFTER it re-mirrors the
+                    # switch (even if it equals the previous one); a reading taken
+                    # before it must not override the echo (_sync_switch_states).
+                    self._switch_commanded[key] = time.monotonic()
         self._publish_command_result(result.status.value, result.reason or key)
 
     def _publish_command_result(self, status: str, detail: str) -> None:
@@ -1455,21 +1461,22 @@ class ScopeWorker:
         echo stands until a reading taken after the command arrives. ``None`` means
         the readings are fresh (startup seed).
         """
-        synced = self._switch_synced
-        for switch_key, field, to_bool in self._SWITCH_FEEDBACK:
-            if field not in state or state[field] is None:
-                continue
-            commanded_at = self._switch_commanded.get(switch_key)
-            if commanded_at is not None:
-                if read_at is not None and read_at < commanded_at:
-                    continue  # reading predates the command; keep the echo
-                self._switch_commanded.pop(switch_key, None)
-                synced.pop(switch_key, None)  # re-mirror even if equal to the last reading
-            value = to_bool(state[field])
-            if synced.get(switch_key) is value:
-                continue
-            synced[switch_key] = value
-            self._publish_control_state(switch_key, value)
+        with self._switch_lock:
+            synced = self._switch_synced
+            for switch_key, field, to_bool in self._SWITCH_FEEDBACK:
+                if field not in state or state[field] is None:
+                    continue
+                commanded_at = self._switch_commanded.get(switch_key)
+                if commanded_at is not None:
+                    if read_at is not None and read_at < commanded_at:
+                        continue  # reading predates the command; keep the echo
+                    self._switch_commanded.pop(switch_key, None)
+                    synced.pop(switch_key, None)  # re-mirror even if equal to the last reading
+                value = to_bool(state[field])
+                if synced.get(switch_key) is value:
+                    continue
+                synced[switch_key] = value
+                self._publish_control_state(switch_key, value)
 
     def _publish_offline_after_failed_cycle(self) -> None:
         """Best-effort ``offline`` for a cycle the catch-all just absorbed.
