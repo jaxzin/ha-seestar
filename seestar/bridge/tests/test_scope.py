@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from seestar_bridge.entities import ENTITIES
+from seestar_bridge.entities import ENTITIES, control_state_topic
 from seestar_bridge.scope import _MAX_PREVIEW_BYTES, ScopeWorker
 from seestar_bridge.settings import MqttSettings, Settings
 
@@ -891,3 +891,70 @@ def test_seed_gives_switches_their_last_known_state(monkeypatch):
     published = {m[0]: m[1] for m in mqtt_client.published}
     assert [p for t, p in published.items() if "tracking_set" in t] == ["OFF"]
     assert [p for t, p in published.items() if "dew_heater_set" in t] == ["ON"]
+
+
+class _AcceptingAlpaca:
+    """Accepts every command (so a dispatched switch is echoed) and records it."""
+
+    def __init__(self):
+        self.calls = []
+
+    def action(self, name, params=None):
+        self.calls.append(name)
+        return "ok"
+
+
+def _switch_states(mqtt, worker, key):
+    """Payloads published to one switch's state topic, in order."""
+    topic = control_state_topic(worker.base_topic, key)
+    return [p for t, p in mqtt.published if t == topic]
+
+
+def test_dispatched_command_echo_is_corrected_by_the_next_reading():
+    """An accepted ON command the scope ignores: echo ON, then the reading puts OFF back.
+
+    Goes through the real command path (handle_command -> _dispatch_control), so it
+    fails if the dispatch stops re-arming the switch for the next reading.
+    """
+    mqtt = _RecordingMqtt()
+    alpaca = _AcceptingAlpaca()
+    worker = ScopeWorker(alpaca=alpaca, device=DEVICE, settings=None,
+                         mqtt_client=mqtt, scope_http_base=None)
+    worker.handle_command(f"{worker.base_topic}/cmd/controls_enabled", "ON")
+    worker._sync_switch_states({"dew_heater": False})
+    mqtt.published.clear()
+
+    worker.handle_command(f"{worker.base_topic}/cmd/dew_heater_set", "ON")
+    assert alpaca.calls == ["action_set_dew_heater"]
+    worker._sync_switch_states({"dew_heater": False})
+    assert _switch_states(mqtt, worker, "dew_heater_set") == ["ON", "OFF"]
+
+
+def test_run_cycle_mirrors_the_scopes_tracking_reading(monkeypatch):
+    """The per-cycle hook in run(): ON, no republish while unchanged, then OFF."""
+    events = [{"ScopeTrack": {"tracking": True}},
+              {"ScopeTrack": {"tracking": True}},
+              {"ScopeTrack": {"tracking": False}}]
+    mqtt_client = _FakeMqtt()
+    worker = _run_cycles(_ScriptedAlpaca(event_states=events, connected=True),
+                         mqtt_client, monkeypatch, cycles=3)
+    topic = control_state_topic(worker.base_topic, "tracking_set")
+    assert [p for t, p, _ in mqtt_client.published if t == topic] == ["ON", "OFF"]
+
+
+def test_wide_camera_switch_goes_off_when_another_camera_is_active():
+    mqtt = _RecordingMqtt()
+    worker = ScopeWorker(alpaca=_StubAlpaca(), device=DEVICE, settings=None,
+                         mqtt_client=mqtt, scope_http_base=None)
+    worker._sync_switch_states({"active_camera": "Wide-field"})
+    worker._sync_switch_states({"active_camera": "Telephoto"})
+    assert _switch_states(mqtt, worker, "wide_cam") == ["ON", "OFF"]
+
+
+def test_switch_ignores_a_none_reading():
+    """A reading that is present but None (unknown) must not flip a switch OFF."""
+    mqtt = _RecordingMqtt()
+    worker = ScopeWorker(alpaca=_StubAlpaca(), device=DEVICE, settings=None,
+                         mqtt_client=mqtt, scope_http_base=None)
+    worker._sync_switch_states({"dew_heater": None, "tracking": None, "active_camera": None})
+    assert mqtt.published == []
