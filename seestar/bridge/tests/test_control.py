@@ -402,11 +402,23 @@ def test_focus_number_maps_to_steps():
     assert params["steps"] == 30
 
 
-def test_stop_maps_to_stop_scheduler():
+def test_stop_without_a_plan_stops_the_view():
+    # No plan running: stop_scheduler would only answer "already in complete
+    # state"; the live view / stack / goto is ended with iscope_stop_view.
     alpaca = _StubAlpaca()
-    result = dispatch(alpaca, "stop", {}, controls_enabled=True, allow_power=False)
+    result = dispatch(alpaca, "stop", "PRESS", controls_enabled=True, allow_power=False,
+                      stored={control.PLAN_ACTIVE_KEY: False})
     assert result.status is DispatchStatus.OK
-    assert alpaca.calls[0][0] == "stop_scheduler"
+    assert alpaca.calls == [("method_sync", {"method": "iscope_stop_view"})]
+
+
+def test_stop_with_a_plan_stops_the_scheduler_then_the_view():
+    alpaca = _StubAlpaca()
+    result = dispatch(alpaca, "stop", "PRESS", controls_enabled=True, allow_power=False,
+                      stored={control.PLAN_ACTIVE_KEY: True})
+    assert result.status is DispatchStatus.OK
+    assert alpaca.calls == [("stop_scheduler", {}),
+                            ("method_sync", {"method": "iscope_stop_view"})]
 
 
 # -- Phase-2 spec-catalog additions: gain / tracking / wide-cam / AF / record ------
@@ -728,3 +740,56 @@ def test_safety_switches_are_not_in_the_dispatch_catalog(safety_key):
     # controls (dispatching them would recurse the gate onto the gate).
     dispatch_keys = {ctl.key for ctl in control.CONTROLS}
     assert safety_key not in dispatch_keys
+
+
+def _no_sleep(monkeypatch):
+    slept = []
+    monkeypatch.setattr(control.time, "sleep", slept.append)
+    return slept
+
+
+def test_park_ends_a_running_view_first(monkeypatch):
+    """Park while a goto/plate-solve runs: stop the view, settle, then park."""
+    slept = _no_sleep(monkeypatch)
+    alpaca = _StubAlpaca()
+    result = dispatch(alpaca, "park", None, controls_enabled=True, allow_power=True,
+                      stored={control.VIEW_BUSY_KEY: True})
+    assert result.status is DispatchStatus.OK
+    assert [p.get("method") for _, p in alpaca.calls] == ["iscope_stop_view", "scope_park"]
+    assert slept == [control.VIEW_STOP_SETTLE_SEC]
+
+
+def test_park_on_an_idle_scope_only_parks(monkeypatch):
+    slept = _no_sleep(monkeypatch)
+    alpaca = _StubAlpaca()
+    dispatch(alpaca, "park", None, controls_enabled=True, allow_power=True, stored={})
+    assert [p.get("method") for _, p in alpaca.calls] == ["scope_park"]
+    assert slept == []
+
+
+def test_park_stops_a_running_plan_and_view(monkeypatch):
+    _no_sleep(monkeypatch)
+    alpaca = _StubAlpaca()
+    dispatch(alpaca, "park", None, controls_enabled=True, allow_power=True,
+             stored={control.PLAN_ACTIVE_KEY: True})
+    assert [n for n, _ in alpaca.calls] == ["stop_scheduler", "method_sync", "method_sync"]
+    assert [p.get("method") for _, p in alpaca.calls[1:]] == ["iscope_stop_view", "scope_park"]
+
+
+def test_goto_ends_the_previous_target_first(monkeypatch):
+    """A new goto while the old one still retries: the old view ends first."""
+    slept = _no_sleep(monkeypatch)
+    alpaca = _StubAlpaca()
+    result = dispatch(alpaca, "goto", None, controls_enabled=True, allow_power=False,
+                      stored={**_goto_stored(), control.VIEW_BUSY_KEY: True})
+    assert result.status is DispatchStatus.OK
+    assert [n for n, _ in alpaca.calls] == ["method_sync", "goto_target"]
+    assert alpaca.calls[0][1]["method"] == "iscope_stop_view"
+    assert slept == [control.VIEW_STOP_SETTLE_SEC]
+
+
+def test_goto_on_an_idle_scope_is_unchanged(monkeypatch):
+    _no_sleep(monkeypatch)
+    alpaca = _StubAlpaca()
+    dispatch(alpaca, "goto", None, controls_enabled=True, allow_power=False, stored=_goto_stored())
+    assert [n for n, _ in alpaca.calls] == ["goto_target"]

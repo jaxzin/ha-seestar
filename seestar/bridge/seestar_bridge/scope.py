@@ -908,7 +908,9 @@ class ScopeWorker:
             self._alpaca, key, payload,
             controls_enabled=self._controls_enabled,
             allow_power=self._allow_power,
-            stored=self._stored_inputs,
+            stored={**self._stored_inputs,
+                    control.PLAN_ACTIVE_KEY: bool(self._published_state.get("plan_active")),
+                    control.VIEW_BUSY_KEY: self._view_busy()},
         )
         if result.status is DispatchStatus.OK:
             self._track_session_ownership(key)
@@ -921,6 +923,13 @@ class ScopeWorker:
                     # before it must not override the echo (_sync_switch_states).
                     self._switch_commanded[key] = time.monotonic()
         self._publish_command_result(result.status.value, result.reason or key)
+
+    def _view_busy(self) -> bool:
+        """A view / goto / stack still runs per the last-known state (for park + goto)."""
+        st = self._published_state
+        view = str(st.get("telephoto_state") or "").lower()
+        return (bool(view) and view not in _VIEW_ENDED_STATES) or bool(st.get("slewing")) \
+            or str(st.get("goto_state") or "").lower() == _GOTO_WORKING
 
     def _publish_command_result(self, status: str, detail: str) -> None:
         """Publish one dispatch outcome (retained) to the command-result topic.

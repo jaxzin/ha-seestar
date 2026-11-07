@@ -222,13 +222,13 @@ another.
 | **Imaging mode** (select) | Chooses the mode (`star` / `scenery` / `planet` / `sun` / `moon`) that **Start live view** will use. | **Value-only**: changing it does nothing until *Start live view* is pressed. Defaults to `star`. |
 | **Start live view** (button) | Starts an imaging session in the selected imaging mode. | Makes this bridge the session's owning client, which is what turns the [Live view camera](#live-view-camera) on. |
 | **Start stacking** (button) | Starts (restarts) stacking on the current target. | Also starts an HA-owned session. |
-| **Stop** (button) | Stops the running scheduler session. | Only stops scheduler-driven sessions — see [Rough edges](#rough-edges). |
+| **Stop** (button) | Stops what is running: a plan (if one runs), then the live view, stack or goto. | Same as seestar_alp's own live-mode stop (`stop_scheduler` while a plan runs, `iscope_stop_view` always). |
 | **Start mosaic** (button) | Starts a mosaic capture. | |
 | **Start spectra** (button) | Starts a spectra capture. | |
 | **Goto target** (text) | Label for the goto session (e.g. `M31`). | **Name only** — seestar_alp does not resolve names to coordinates. |
 | **Goto RA** (text) | Right ascension for **Goto**. | Decimal hours (`0.7123`) or sexagesimal (`0h42m44s`, `0:42:44`); 0–24 h, J2000. |
 | **Goto Dec** (text) | Declination for **Goto**. | Decimal degrees (`41.269`) or sexagesimal (`+41d16m9s`, `-05:23:28`); ±90°, J2000. |
-| **Goto** (button) | Slews to the stored RA/Dec, labelled with the stored target name. | **Refuses without parseable, in-range coordinates** — it never guesses where a name is. |
+| **Goto** (button) | Slews to the stored RA/Dec, labelled with the stored target name. A view, goto or plan still running is ended first (`iscope_stop_view`, a 3 s pause), so the firmware drops the old target. | **Refuses without parseable, in-range coordinates** — it never guesses where a name is. |
 | **Stop goto** (button) | Aborts an in-progress goto. | |
 | **Stack exposure** (number) | Sets the stacking exposure **in milliseconds** (1–60000). | ms end-to-end: solar work is ~1–5 ms; deep-sky stacking is tens of seconds (`10000`, `30000`). |
 | **Gain** (number) | Sets the camera ISP gain (0–300). | The same `set_setting` call seestar_alp's own web UI makes. |
@@ -246,7 +246,7 @@ another.
 | **Skip current target** (button) | Skips the plan's current item. | |
 | **Reset current item** (button) | Resets the plan's current item. | |
 | **Startup sequence** (button) | Runs the scope's startup sequence. | **Power-gated.** |
-| **Park** (button) | Stows the mount arm. | **Power-gated.** Park only stows — it never powers off. |
+| **Park** (button) | Stows the mount arm. A view, goto or plan still running is ended first, so the scope doesn't resume it after the arm folded. | **Power-gated.** Park only stows — it never powers off. |
 | **Shutdown** (button) | Powers off the **whole device** (parks, then halts). | **Power-gated.** |
 
 ### Live view camera
@@ -270,9 +270,6 @@ left out is listed under
 [Deliberate omissions](#deliberate-omissions) below. Known edges, verified
 against seestar_alp:
 
-- **Stop only stops scheduler-driven sessions.** The *Stop* button maps to
-  seestar_alp's `stop_scheduler`, so a live view or stack started outside the
-  scheduler is not stopped by it.
 - **Plate-solve loop ON is a no-op on firmware newer than 2.47.** seestar_alp
   answers `start_plate_solve_loop` with a "Deprecated" warning and does nothing;
   turning the switch OFF still calls `stop_plate_solve_loop`.
