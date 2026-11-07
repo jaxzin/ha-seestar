@@ -12,6 +12,7 @@ import json
 import struct
 import sys
 import threading
+import time
 import warnings
 import zlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -958,3 +959,27 @@ def test_switch_ignores_a_none_reading():
                          mqtt_client=mqtt, scope_http_base=None)
     worker._sync_switch_states({"dew_heater": None, "tracking": None, "active_camera": None})
     assert mqtt.published == []
+
+
+def test_reading_taken_before_a_command_does_not_flip_the_echo_back():
+    """A cycle that started before the command landed must not undo the echo.
+
+    The command arrives on the MQTT thread mid-cycle; the cycle's (pre-command)
+    reading then reaches _sync_switch_states. It is skipped, and the first reading
+    taken after the command decides the switch -- no ON -> OFF -> ON flicker.
+    """
+    mqtt = _RecordingMqtt()
+    worker = ScopeWorker(alpaca=_AcceptingAlpaca(), device=DEVICE, settings=None,
+                         mqtt_client=mqtt, scope_http_base=None)
+    worker.handle_command(f"{worker.base_topic}/cmd/controls_enabled", "ON")
+    worker._sync_switch_states({"dew_heater": False})
+    mqtt.published.clear()
+
+    cycle_started = time.monotonic()
+    worker.handle_command(f"{worker.base_topic}/cmd/dew_heater_set", "ON")   # lands mid-cycle
+    worker._sync_switch_states({"dew_heater": False}, cycle_started)         # stale reading
+    assert _switch_states(mqtt, worker, "dew_heater_set") == ["ON"]
+
+    # the first reading taken after the command is authoritative: the scope ignored it
+    worker._sync_switch_states({"dew_heater": False}, time.monotonic())
+    assert _switch_states(mqtt, worker, "dew_heater_set") == ["ON", "OFF"]
