@@ -412,6 +412,15 @@ class ScopeWorker:
         self._stored_inputs: dict[str, str] = {
             control.IMAGING_MODE_KEY: control.DEFAULT_IMAGING_MODE,
         }
+        # Last switch state mirrored from the scope's own reading (_sync_switch_states),
+        # and when (time.monotonic) each switch last had a command echoed to it.
+        self._switch_synced: dict[str, bool] = {}
+        self._switch_commanded: dict[str, float] = {}
+        # Serializes "echo a command + stamp it" (MQTT thread) against "check the
+        # stamp + cache + publish a reading" (worker thread): without it a stale
+        # reading can pass the stamp check, lose the race to a command echo, and
+        # then overwrite that echo.
+        self._switch_lock = threading.Lock()
         # Last-known merged state snapshot (see the _CYCLE_FRESH_KEYS block):
         # seeded once from our own retained state topic at startup, then merged
         # set-when-present each cycle so a driver restart's sparse events never
@@ -904,7 +913,13 @@ class ScopeWorker:
         if result.status is DispatchStatus.OK:
             self._track_session_ownership(key)
             if self._control_is_stateful(key):
-                self._publish_control_state(key, payload)
+                with self._switch_lock:
+                    self._publish_control_state(key, payload)
+                    # The echo may not be what the scope ends up doing: record when
+                    # it was sent so the next reading TAKEN AFTER it re-mirrors the
+                    # switch (even if it equals the previous one); a reading taken
+                    # before it must not override the echo (_sync_switch_states).
+                    self._switch_commanded[key] = time.monotonic()
         self._publish_command_result(result.status.value, result.reason or key)
 
     def _publish_command_result(self, status: str, detail: str) -> None:
@@ -1299,6 +1314,10 @@ class ScopeWorker:
             self._published_state.update(seeded)
             _log.info("%s: seeded %d last-known fields from retained state",
                       self._device_id, len(seeded))
+            # Give the switches their last-known reading right away: a switch
+            # that was never commanded has no retained state and would read
+            # 'unknown' until the scope next reports that field.
+            self._sync_switch_states(seeded)
 
     def _parse_retained_seed(self, payload: Any) -> dict[str, Any]:
         """Filter one retained state payload down to seedable catalog fields.
@@ -1364,6 +1383,7 @@ class ScopeWorker:
 
         while True:
             try:
+                read_at = time.monotonic()  # every reading below is taken after this
                 now = time.time()
                 state, saved_fullname, reachable = self._poll_once(now)
                 # The connectivity binary_sensor must have a producer: drive it from
@@ -1412,6 +1432,7 @@ class ScopeWorker:
                 self._published_state.update(state)
                 self._mqtt.publish(
                     self.state_topic, json.dumps(self._published_state), retain=True)
+                self._sync_switch_states(state, read_at)
                 last_preview_file = self._maybe_publish_preview(saved_fullname, last_preview_file)
                 self._maybe_publish_live(reachable)
             except Exception:  # the worker loop must be unkillable (see docstring)
@@ -1419,6 +1440,43 @@ class ScopeWorker:
                                self._device_id)
                 self._publish_offline_after_failed_cycle()
             time.sleep(event_poll)
+
+    #: Switches whose retained state is only the echo of the last accepted command,
+    #: paired with the read-only field that reports what the scope actually does.
+    _SWITCH_FEEDBACK = (("dew_heater_set", "dew_heater", bool), ("tracking_set", "tracking", bool),
+                        ("wide_cam", "active_camera", lambda v: v == "Wide-field"))
+
+    def _sync_switch_states(self, state: dict, read_at: float | None = None) -> None:
+        """Mirror the scope's reported heater/tracking/wide-camera state onto the switches.
+
+        A switch's state_topic otherwise only echoes the last command the bridge
+        accepted, so it drifts when the scope changes on its own (app, reboot,
+        auto power-off) or ignores the command: HA would show "on" while the
+        heater is off. Only fields observed THIS cycle are mirrored, and only on
+        change, so a missing reading never flips the switch.
+
+        ``read_at`` is when (``time.monotonic``) the cycle's readings started. A
+        command echoed after that moment (it arrives on the MQTT thread while the
+        cycle runs) makes the reading stale for that switch: it is skipped and the
+        echo stands until a reading taken after the command arrives. ``None`` means
+        the readings are fresh (startup seed).
+        """
+        with self._switch_lock:
+            synced = self._switch_synced
+            for switch_key, field, to_bool in self._SWITCH_FEEDBACK:
+                if field not in state or state[field] is None:
+                    continue
+                commanded_at = self._switch_commanded.get(switch_key)
+                if commanded_at is not None:
+                    if read_at is not None and read_at < commanded_at:
+                        continue  # reading predates the command; keep the echo
+                    self._switch_commanded.pop(switch_key, None)
+                    synced.pop(switch_key, None)  # re-mirror even if equal to the last reading
+                value = to_bool(state[field])
+                if synced.get(switch_key) is value:
+                    continue
+                synced[switch_key] = value
+                self._publish_control_state(switch_key, value)
 
     def _publish_offline_after_failed_cycle(self) -> None:
         """Best-effort ``offline`` for a cycle the catch-all just absorbed.

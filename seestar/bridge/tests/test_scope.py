@@ -12,6 +12,7 @@ import json
 import struct
 import sys
 import threading
+import time
 import warnings
 import zlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -19,7 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from seestar_bridge.entities import ENTITIES
+from seestar_bridge.entities import ENTITIES, control_state_topic
 from seestar_bridge.scope import _MAX_PREVIEW_BYTES, ScopeWorker
 from seestar_bridge.settings import MqttSettings, Settings
 
@@ -828,3 +829,212 @@ def test_device_state_storage_computed_from_lowercase_keys():
 
 def test_device_state_storage_empty_volume_list():
     assert "disk_used_pct" not in ScopeWorker.extract_device_state({"storage": {"storage_volume": []}})
+
+
+class _RecordingMqtt:
+    def __init__(self):
+        self.published = []
+
+    def publish(self, topic, payload, retain=False):
+        self.published.append((topic, payload))
+
+
+def test_switch_states_follow_the_scopes_own_reading():
+    """The heater/tracking switches mirror what the scope reports, only on change."""
+    mqtt = _RecordingMqtt()
+    worker = ScopeWorker(alpaca=_StubAlpaca(), device=DEVICE, settings=None,
+                         mqtt_client=mqtt, scope_http_base=None)
+    worker._sync_switch_states({"dew_heater": False, "tracking": True})
+    topics = dict(mqtt.published)
+    heater = [t for t in topics if t.endswith("dew_heater_set/state") or "dew_heater_set" in t]
+    tracking = [t for t in topics if "tracking_set" in t]
+    assert heater and topics[heater[0]] == "OFF"
+    assert tracking and topics[tracking[0]] == "ON"
+
+    mqtt.published.clear()
+    worker._sync_switch_states({"dew_heater": False})        # unchanged -> no publish
+    worker._sync_switch_states({})                           # not observed -> no publish
+    assert mqtt.published == []
+    worker._sync_switch_states({"dew_heater": True})
+    assert [p for _, p in mqtt.published] == ["ON"]
+
+
+def test_switch_resyncs_after_a_command_echo():
+    """Command echoed ON, scope still reports OFF -> the switch goes back to OFF."""
+    mqtt = _RecordingMqtt()
+    worker = ScopeWorker(alpaca=_StubAlpaca(), device=DEVICE, settings=None,
+                         mqtt_client=mqtt, scope_http_base=None)
+    worker._sync_switch_states({"dew_heater": False})
+    worker._switch_synced.pop("dew_heater_set", None)      # what a dispatched echo does
+    mqtt.published.clear()
+    worker._sync_switch_states({"dew_heater": False})
+    assert [p for t, p in mqtt.published if "dew_heater_set" in t] == ["OFF"]
+
+
+def test_wide_camera_switch_follows_the_setting():
+    """S30 series: the wide-camera switch mirrors Setting.wide_cam."""
+    mqtt = _RecordingMqtt()
+    worker = ScopeWorker(alpaca=_StubAlpaca(), device=DEVICE, settings=None,
+                         mqtt_client=mqtt, scope_http_base=None)
+    state = {}
+    worker._extract_cameras(state, lambda *path: True if path == ("Setting", "wide_cam") else None)
+    assert state["active_camera"] == "Wide-field"
+    worker._sync_switch_states(state)
+    assert [p for t, p in mqtt.published if t.endswith("wide_cam/state")] == ["ON"]
+
+
+def test_seed_gives_switches_their_last_known_state(monkeypatch):
+    """A never-commanded switch reads the seeded reading, not 'unknown', after a restart."""
+    retained = json.dumps({"tracking": False, "dew_heater": True}).encode()
+    mqtt_client = _SeedableFakeMqtt(retained=retained)
+    _run_cycles(_ScriptedAlpaca(event_states=[{}], connected=False),
+                mqtt_client, monkeypatch, cycles=1)
+    published = {m[0]: m[1] for m in mqtt_client.published}
+    assert [p for t, p in published.items() if "tracking_set" in t] == ["OFF"]
+    assert [p for t, p in published.items() if "dew_heater_set" in t] == ["ON"]
+
+
+class _AcceptingAlpaca:
+    """Accepts every command (so a dispatched switch is echoed) and records it."""
+
+    def __init__(self):
+        self.calls = []
+
+    def action(self, name, params=None):
+        self.calls.append(name)
+        return "ok"
+
+
+def _switch_states(mqtt, worker, key):
+    """Payloads published to one switch's state topic, in order."""
+    topic = control_state_topic(worker.base_topic, key)
+    return [p for t, p in mqtt.published if t == topic]
+
+
+def test_dispatched_command_echo_is_corrected_by_the_next_reading():
+    """An accepted ON command the scope ignores: echo ON, then the reading puts OFF back.
+
+    Goes through the real command path (handle_command -> _dispatch_control), so it
+    fails if the dispatch stops re-arming the switch for the next reading.
+    """
+    mqtt = _RecordingMqtt()
+    alpaca = _AcceptingAlpaca()
+    worker = ScopeWorker(alpaca=alpaca, device=DEVICE, settings=None,
+                         mqtt_client=mqtt, scope_http_base=None)
+    worker.handle_command(f"{worker.base_topic}/cmd/controls_enabled", "ON")
+    worker._sync_switch_states({"dew_heater": False})
+    mqtt.published.clear()
+
+    worker.handle_command(f"{worker.base_topic}/cmd/dew_heater_set", "ON")
+    assert alpaca.calls == ["action_set_dew_heater"]
+    worker._sync_switch_states({"dew_heater": False})
+    assert _switch_states(mqtt, worker, "dew_heater_set") == ["ON", "OFF"]
+
+
+def test_run_cycle_mirrors_the_scopes_tracking_reading(monkeypatch):
+    """The per-cycle hook in run(): ON, no republish while unchanged, then OFF."""
+    events = [{"ScopeTrack": {"tracking": True}},
+              {"ScopeTrack": {"tracking": True}},
+              {"ScopeTrack": {"tracking": False}}]
+    mqtt_client = _FakeMqtt()
+    worker = _run_cycles(_ScriptedAlpaca(event_states=events, connected=True),
+                         mqtt_client, monkeypatch, cycles=3)
+    topic = control_state_topic(worker.base_topic, "tracking_set")
+    assert [p for t, p, _ in mqtt_client.published if t == topic] == ["ON", "OFF"]
+
+
+def test_wide_camera_switch_goes_off_when_another_camera_is_active():
+    mqtt = _RecordingMqtt()
+    worker = ScopeWorker(alpaca=_StubAlpaca(), device=DEVICE, settings=None,
+                         mqtt_client=mqtt, scope_http_base=None)
+    worker._sync_switch_states({"active_camera": "Wide-field"})
+    worker._sync_switch_states({"active_camera": "Telephoto"})
+    assert _switch_states(mqtt, worker, "wide_cam") == ["ON", "OFF"]
+
+
+def test_switch_ignores_a_none_reading():
+    """A reading that is present but None (unknown) must not flip a switch OFF."""
+    mqtt = _RecordingMqtt()
+    worker = ScopeWorker(alpaca=_StubAlpaca(), device=DEVICE, settings=None,
+                         mqtt_client=mqtt, scope_http_base=None)
+    worker._sync_switch_states({"dew_heater": None, "tracking": None, "active_camera": None})
+    assert mqtt.published == []
+
+
+def test_reading_taken_before_a_command_does_not_flip_the_echo_back():
+    """A cycle that started before the command landed must not undo the echo.
+
+    The command arrives on the MQTT thread mid-cycle; the cycle's (pre-command)
+    reading then reaches _sync_switch_states. It is skipped, and the first reading
+    taken after the command decides the switch -- no ON -> OFF -> ON flicker.
+    """
+    mqtt = _RecordingMqtt()
+    worker = ScopeWorker(alpaca=_AcceptingAlpaca(), device=DEVICE, settings=None,
+                         mqtt_client=mqtt, scope_http_base=None)
+    worker.handle_command(f"{worker.base_topic}/cmd/controls_enabled", "ON")
+    worker._sync_switch_states({"dew_heater": False})
+    mqtt.published.clear()
+
+    cycle_started = time.monotonic()
+    worker.handle_command(f"{worker.base_topic}/cmd/dew_heater_set", "ON")   # lands mid-cycle
+    worker._sync_switch_states({"dew_heater": False}, cycle_started)         # stale reading
+    assert _switch_states(mqtt, worker, "dew_heater_set") == ["ON"]
+
+    # the first reading taken after the command is authoritative: the scope ignored it
+    worker._sync_switch_states({"dew_heater": False}, time.monotonic())
+    assert _switch_states(mqtt, worker, "dew_heater_set") == ["ON", "OFF"]
+
+
+class _GatedMqtt(_RecordingMqtt):
+    """Holds ONE publish (made by ``gate_thread``) open until released.
+
+    The payload is recorded only AFTER the gate opens, i.e. it lands in
+    ``published`` at the moment it would reach the broker -- so the recorded order
+    is the order the broker would see.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.gate_thread = None
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def publish(self, topic, payload, retain=False):
+        if threading.current_thread() is self.gate_thread and not self.entered.is_set():
+            self.entered.set()
+            assert self.release.wait(5), "test never released the gated publish"
+        super().publish(topic, payload, retain)
+
+
+def test_command_landing_while_a_sync_is_publishing_is_not_overwritten():
+    """Race: sync passed its stamp check, a command echo lands, sync then publishes.
+
+    The sync thread is parked inside its publish (after it checked there was no
+    command). A command is then dispatched on another thread. The command must not
+    slip in between sync's check and publish: the final broker state has to be the
+    command's ON, not sync's stale OFF.
+    """
+    mqtt = _GatedMqtt()
+    worker = ScopeWorker(alpaca=_AcceptingAlpaca(), device=DEVICE, settings=None,
+                         mqtt_client=mqtt, scope_http_base=None)
+    worker.handle_command(f"{worker.base_topic}/cmd/controls_enabled", "ON")
+    mqtt.published.clear()
+
+    cycle_started = time.monotonic()
+    sync = threading.Thread(
+        target=lambda: worker._sync_switch_states({"dew_heater": False}, cycle_started))
+    mqtt.gate_thread = sync
+    sync.start()
+    assert mqtt.entered.wait(5), "sync never reached its publish"
+
+    command = threading.Thread(
+        target=worker.handle_command,
+        args=(f"{worker.base_topic}/cmd/dew_heater_set", "ON"))
+    command.start()
+    command.join(0.3)   # unserialized, the command finishes (publishing ON) right here
+    mqtt.release.set()
+    sync.join(5)
+    command.join(5)
+    assert not sync.is_alive() and not command.is_alive()
+
+    assert _switch_states(mqtt, worker, "dew_heater_set") == ["OFF", "ON"]
