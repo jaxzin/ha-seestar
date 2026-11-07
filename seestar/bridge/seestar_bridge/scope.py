@@ -665,6 +665,19 @@ class ScopeWorker:
             out["battery"] = d("pi_status", "battery_capacity")
         if d("pi_status", "charger_status"):
             out["charger_status"] = d("pi_status", "charger_status")
+        # Storage: the DiskSpace event is rare (some firmware never sends it), but
+        # get_device_state always lists the volumes. Only a mounted volume has
+        # meaningful numbers (in USB-storage mode it reads "connected").
+        volume = d("storage", "storage_volume", 0)
+        if isinstance(volume, dict) and volume.get("state") == "mounted":
+            used = volume.get("used_percent")
+            if used is None:
+                total = volume.get("totalMB", volume.get("total_mb"))
+                free = volume.get("freeMB", volume.get("free_mb"))
+                if total and free is not None:
+                    used = round(100 * (1 - free / total))
+            if used is not None:
+                out["disk_used_pct"] = used
         return out
 
     # -- discovery + preview ----------------------------------------------------

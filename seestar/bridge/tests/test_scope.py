@@ -803,3 +803,28 @@ def test_fetch_preview_downscales_valid_jpeg():
     # Downscaled to <= preview_max_px on the long edge.
     decoded = pil.open(io.BytesIO(out))
     assert max(decoded.size) <= 1280
+
+
+def test_device_state_storage_used_percent():
+    vol = {"name": "emmc", "state": "mounted", "totalMB": 51854, "freeMB": 46907, "used_percent": 21}
+    assert ScopeWorker.extract_device_state({"storage": {"storage_volume": [vol]}})["disk_used_pct"] == 21
+
+
+def test_device_state_storage_computed_from_free_and_total():
+    vol = {"state": "mounted", "totalMB": 50000, "freeMB": 12500}
+    assert ScopeWorker.extract_device_state({"storage": {"storage_volume": [vol]}})["disk_used_pct"] == 75
+
+
+def test_device_state_storage_ignored_in_usb_mode():
+    vol = {"state": "connected", "totalMB": 50000, "freeMB": 0}
+    assert "disk_used_pct" not in ScopeWorker.extract_device_state({"storage": {"storage_volume": [vol]}})
+    assert "disk_used_pct" not in ScopeWorker.extract_device_state({"storage": {}})
+
+
+def test_device_state_storage_computed_from_lowercase_keys():
+    vol = {"state": "mounted", "total_mb": 50000, "free_mb": 12500}
+    assert ScopeWorker.extract_device_state({"storage": {"storage_volume": [vol]}})["disk_used_pct"] == 75
+
+
+def test_device_state_storage_empty_volume_list():
+    assert "disk_used_pct" not in ScopeWorker.extract_device_state({"storage": {"storage_volume": []}})
