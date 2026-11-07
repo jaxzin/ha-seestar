@@ -84,6 +84,12 @@ https://github.com/jaxzin/ha_seestar_alp
 https://github.com/jaxzin/ha-seestar
 ```
 
+On Home Assistant OS or Supervised, these badges open the add-repository dialog
+in your own Home Assistant with each URL pre-filled:
+
+- **Seestar Alpaca driver:** [![Open your Home Assistant instance and show the add add-on repository dialog with the ha_seestar_alp repository pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fjaxzin%2Fha_seestar_alp)
+- **Seestar for Home Assistant:** [![Open your Home Assistant instance and show the add add-on repository dialog with the ha-seestar repository pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fjaxzin%2Fha-seestar)
+
 ### 3. Seestar Alpaca driver
 
 1. Install **Seestar Alpaca driver (seestar_alp)**.
