@@ -33,6 +33,7 @@ from __future__ import annotations
 import enum
 import logging
 import re
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
@@ -102,6 +103,15 @@ GOTO_DEC_KEY = "goto_dec"
 #: Worker-injected (never an HA entity): whether a plan is running right now,
 #: read from the last-known state when 'Stop' is pressed.
 PLAN_ACTIVE_KEY = "_plan_active"
+#: Worker-injected (never an HA entity): whether a view, goto or stack is still
+#: running (telephoto View not ended, AutoGoto working), read at press time.
+VIEW_BUSY_KEY = "_view_busy"
+#: Pseudo-call handled by _execute (never sent to seestar_alp): wait between
+#: ending a running view and the next command, so the firmware has let go of the
+#: old target (plate-solve retries, autofocus) before it gets the new one.
+_PAUSE = "_pause"
+#: Seconds to wait after iscope_stop_view before park / a new goto.
+VIEW_STOP_SETTLE_SEC = 3.0
 
 #: Label sent to goto_target when the operator set coordinates but no name.
 _GOTO_DEFAULT_NAME = "HA goto"
@@ -313,6 +323,28 @@ def _stop(payload: Any) -> Sequence[Call]:
     return calls
 
 
+def _end_running(stored: Mapping[str, Any]) -> list[Call]:
+    """Calls that end a running plan / view before park or a new goto.
+
+    Without them the firmware keeps the old target: a goto still retrying its
+    plate-solve ignores a new goto, and after a park it resumes (exposure, even a
+    slew). Only sent when something runs (iscope_stop_view on an idle scope is
+    pointless), followed by a short pause so the firmware has let go.
+    """
+    calls: list[Call] = []
+    if stored.get(PLAN_ACTIVE_KEY):
+        calls.append(("stop_scheduler", {}))
+    if stored.get(VIEW_BUSY_KEY) or stored.get(PLAN_ACTIVE_KEY):
+        calls.append((_METHOD_SYNC, {"method": _METHOD_ISCOPE_STOP_VIEW}))
+        calls.append((_PAUSE, {"seconds": VIEW_STOP_SETTLE_SEC}))
+    return calls
+
+
+def _running_flags(stored: Mapping[str, Any]) -> dict[str, bool]:
+    return {PLAN_ACTIVE_KEY: bool(stored.get(PLAN_ACTIVE_KEY)),
+            VIEW_BUSY_KEY: bool(stored.get(VIEW_BUSY_KEY))}
+
+
 def _parse_angle(raw: Any, *, label: str) -> float:
     """Parse a decimal or sexagesimal coordinate string to a float, or refuse.
 
@@ -354,7 +386,7 @@ def _goto(payload: Any) -> Sequence[Call]:
     if not -_DEC_DEG_LIMIT <= dec <= _DEC_DEG_LIMIT:
         raise ValueError(f"goto Dec {dec} outside ±{_DEC_DEG_LIMIT} degrees")
     target_name = str(stored.get("target_name") or "").strip() or _GOTO_DEFAULT_NAME
-    return [("goto_target", {
+    return [*_end_running(stored), ("goto_target", {
         "target_name": target_name,
         "is_j2000": True,
         "ra": ra,
@@ -453,7 +485,7 @@ def _plate_solve_loop(payload: Any) -> Sequence[Call]:
     return [(action, {})]
 
 
-def _park(_payload: Any) -> Sequence[Call]:
+def _park(payload: Any) -> Sequence[Call]:
     """Stow the MOUNT ONLY via scope_park (power-gated); never powers off.
 
     Verified against seestar_alp: ``scope_park`` is the raw mount-stow RPC its
@@ -461,8 +493,12 @@ def _park(_payload: Any) -> Sequence[Call]:
     endpoint is a no-op stub, so method_sync is the working transport for it.
     Park MUST NOT share a builder with shutdown — ``pi_shutdown`` powers off the
     entire device (park + Pi halt).
+
+    A running plan / view is ended first (_end_running): otherwise the firmware
+    finishes its goto/plate-solve after the arm folded and may slew again.
     """
-    return [(_METHOD_SYNC, {"method": _METHOD_SCOPE_PARK})]
+    stored = payload if isinstance(payload, dict) else {}
+    return [*_end_running(stored), (_METHOD_SYNC, {"method": _METHOD_SCOPE_PARK})]
 
 
 def _shutdown(_payload: Any) -> Sequence[Call]:
@@ -498,6 +534,10 @@ def _as_number(payload: Any) -> float | int:
 # - 'Stop' ends a running plan (stop_scheduler) and then the view itself
 #   (iscope_stop_view), like seestar_alp's own live-mode stop; "plan running" is
 #   the last-known plan_active reading the worker passes in.
+# - 'Park' and 'Goto' first end a running plan / view (stop_scheduler,
+#   iscope_stop_view) and wait VIEW_STOP_SETTLE_SEC: the firmware otherwise keeps
+#   its old target (plate-solve retries) and resumes it after a park or ignores
+#   the new goto. The pause blocks only that one dispatch.
 # - 'Plate-solve loop' ON is a firmware > 2.47 no-op: seestar_alp answers
 #   start_plate_solve_loop with a "Deprecated" warning and does nothing (OFF
 #   still calls stop_plate_solve_loop).
@@ -532,6 +572,7 @@ CONTROLS: list[Control] = [
                 "target_name": stored.get(GOTO_TARGET_KEY),
                 "ra": stored.get(GOTO_RA_KEY),
                 "dec": stored.get(GOTO_DEC_KEY),
+                **_running_flags(stored),
             }),
     Control("stop_goto", COMPONENT_BUTTON, "Stop goto",
             _simple("stop_goto_target", {})),
@@ -573,7 +614,8 @@ CONTROLS: list[Control] = [
             _simple("action_start_up_sequence", {}), power_gated=True),
     # Park stows the MOUNT ONLY (scope_park); Shutdown powers off the WHOLE
     # device (pi_shutdown). They deliberately have DIFFERENT builders.
-    Control("park", COMPONENT_BUTTON, "Park", _park, power_gated=True),
+    Control("park", COMPONENT_BUTTON, "Park", _park, power_gated=True,
+            payload_from_stored=_running_flags),
     Control("shutdown", COMPONENT_BUTTON, "Shutdown", _shutdown, power_gated=True),
 ]
 
@@ -687,13 +729,16 @@ def _execute(alpaca: Any, control: Control, calls: Sequence[Call]) -> DispatchRe
     """
     try:
         for action_name, params in calls:
+            if action_name == _PAUSE:
+                time.sleep(float(params.get("seconds", 0)))
+                continue
             alpaca.action(action_name, params)
     except (RuntimeError, TimeoutError, OSError, ValueError) as exc:
         reason = f"{control.key}: {action_name} failed: {exc}"
         _log.warning("control dispatch error: %s", reason)
         return DispatchResult(DispatchStatus.ERROR, reason)
     _log.info("control dispatched: %s -> %s", control.key,
-              [name for name, _ in calls])
+              [name for name, _ in calls if name != _PAUSE])
     return DispatchResult(DispatchStatus.OK)
 
 

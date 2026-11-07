@@ -1038,3 +1038,16 @@ def test_command_landing_while_a_sync_is_publishing_is_not_overwritten():
     assert not sync.is_alive() and not command.is_alive()
 
     assert _switch_states(mqtt, worker, "dew_heater_set") == ["OFF", "ON"]
+
+
+def test_view_busy_follows_the_last_known_view_and_goto():
+    worker = ScopeWorker(alpaca=_StubAlpaca(), device=DEVICE, settings=None,
+                         mqtt_client=None, scope_http_base=None)
+    worker._published_state = {"telephoto_state": "working"}
+    assert worker._view_busy() is True
+    worker._published_state = {"telephoto_state": "cancel"}
+    assert worker._view_busy() is False
+    worker._published_state = {"telephoto_state": "complete", "goto_state": "working"}
+    assert worker._view_busy() is True
+    worker._published_state = {}
+    assert worker._view_busy() is False
