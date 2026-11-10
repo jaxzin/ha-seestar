@@ -4,7 +4,7 @@ The standalone `seestar_alp` container on heimdall (`pi@heimdall`, compose proje
 `seestar-ha` in `/home/pi/seestar-ha`) is retired. seestar_alp now runs on Home
 Assistant as its own add-on, and this repo's add-on is a bridge only.
 
-Conventions: HA is `homeassistant.iot.jaxzin.com`; the HA device id is
+Conventions: HA is `homeassistant.jaxzin.casa`; the HA device id is
 `seestar_s30_pro` (topics `seestar/seestar_s30_pro/*`). **Never rename topics,
 unique ids or the scope name**: the device id is the slug of the scope name, and
 renaming orphans the existing entities and history. `controls_enabled` and
