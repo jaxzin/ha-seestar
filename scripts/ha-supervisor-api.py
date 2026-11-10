@@ -13,7 +13,7 @@ Secrets only ever travel on stdin (never argv, never a file):
 
 Usage (run where the LAN is reachable, e.g. over ssh to heimdall):
 
-    HA_WS_URL=wss://homeassistant.iot.jaxzin.com/api/websocket \\
+    HA_WS_URL=wss://homeassistant.jaxzin.casa/api/websocket \\
       ha-supervisor-api.py < request.stdin
 
 Prints the JSON result with every non-empty password/token/secret/key/pem value masked.
@@ -48,7 +48,7 @@ def main() -> int:
     if pem_b64:
         request.setdefault("data", {}).setdefault("options", {})[REDACT] = pem_b64
 
-    url = os.environ.get("HA_WS_URL", "wss://homeassistant.iot.jaxzin.com/api/websocket")
+    url = os.environ.get("HA_WS_URL", "wss://homeassistant.jaxzin.casa/api/websocket")
     ws = websocket.create_connection(url, timeout=30)
     try:
         json.loads(ws.recv())  # auth_required
