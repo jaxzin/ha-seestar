@@ -7,7 +7,7 @@
 # architecture).
 name: Seestar for Home Assistant
 slug: seestar
-version: "1.1.0"
+version: "1.2.0"
 description: >-
   Live Seestar imaging telemetry, a stacked-image preview and controls in Home
   Assistant via MQTT discovery. Pairs with the seestar_alp add-on.

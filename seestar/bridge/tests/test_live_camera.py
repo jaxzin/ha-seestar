@@ -1,13 +1,13 @@
-"""Tests for the Phase-2 live ``/vid`` camera, gated on session ownership.
+"""Tests for the Phase-2 live camera, gated on an active session.
 
-The live camera has ONE load-bearing invariant (the firmware boundary from the
-Phase-2 spec): seestar_alp's ``:7556/vid`` MJPEG stream only serves real frames
-to the session's OWNING client — a passive observer gets an Idle placeholder.
-So the bridge must (a) only poll the imaging port while it owns the session
-(a session-starting command dispatched OK through THIS bridge), (b) surface
-not-owned as the camera's own availability topic reading ``offline``, and
-(c) flip ownership off again on stop/park/shutdown or when the event stream
-reports the View ended.
+The bridge must (a) only contact seestar_alp's imaging server while a session
+is active — one it owns (a session-starting command dispatched OK through THIS
+bridge) or a stack it SEES progressing (the stack count changed between its
+polls, e.g. a stack started from the Seestar app), (b) serve a stack from the
+cached ``snapshot.jpg`` and never from ``/vid``, keeping ``/vid`` for owned
+video-mode sessions, (c) surface "no active session" as the camera's own
+availability topic reading ``offline``, and (d) flip ownership off again on
+stop/park/shutdown or when the event stream reports the View ended.
 
 These tests drive the REAL worker paths — ``handle_command`` (paho's command
 thread) for the ownership writes and one ``run()`` cycle (the poll thread) for
@@ -42,9 +42,13 @@ from seestar_bridge.settings import (
 DEVICE = {"DeviceName": "Seestar Alpha", "DeviceNumber": 1}
 DEVICE_ID = "seestar_alpha"
 
-#: Event state of an actively-owned live session: the View event is 'working',
-#: which must NOT clear ownership on the poll-side refresh.
-EVENT_VIEW_WORKING = {"View": {"target_name": "M31", "state": "working", "mode": "star"}}
+#: Event state of an owned live session: the View event is 'working' (which
+#: must NOT clear ownership on the poll-side refresh) in a video mode, where
+#: the live camera grabs /vid. Stacks are covered by EVENT_STACKING below.
+EVENT_VIEW_WORKING = {"View": {"target_name": "M31", "state": "working", "mode": "scenery"}}
+
+#: A View that ended (seestar_alp terminal state): no session is active.
+EVENT_VIEW_ENDED = {"View": {"target_name": "M31", "state": "cancel", "mode": "star"}}
 
 #: seestar_alp delimits its multipart MJPEG parts with this boundary
 #: (device/seestar_imaging.py: ``BOUNDARY = b"\r\n--frame\r\n"``).
@@ -78,18 +82,24 @@ _LOADING_GIF = b"GIF89a" + b"\x00" * 64
 # --- stubs ------------------------------------------------------------------------
 
 class _ImagingStub:
-    """Stub of seestar_alp's :7556 imaging server serving one scripted stream.
+    """Stub of seestar_alp's :7556 imaging server.
 
-    Records every request path, so a test can prove the not-owned path NEVER
-    contacted the imaging port (request_count == 0), not merely that no frame
-    was published.
+    ``/<dev>/vid`` serves one scripted MJPEG stream; every request is recorded
+    in ``requests``, so a test can prove a path NEVER opened /vid
+    (request_count == 0), not merely that no frame was published.
+    ``/<dev>/snapshot.jpg`` answers from ``snapshot`` — ``None`` is a
+    seestar_alp without the endpoint (404) — and records each request's
+    If-None-Match in ``snapshot_requests``.
     """
 
-    def __init__(self, stream: bytes):
+    def __init__(self, stream: bytes, snapshot: "_Snapshot | None" = None):
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
+                if self.path.endswith("/snapshot.jpg"):
+                    self._snapshot()
+                    return
                 with stub._lock:
                     stub.requests.append(self.path)
                 self.send_response(200)
@@ -98,10 +108,38 @@ class _ImagingStub:
                 self.end_headers()
                 self.wfile.write(stub._stream)
 
+            def _snapshot(self):
+                if_none_match = self.headers.get("If-None-Match")
+                with stub._lock:
+                    stub.snapshot_requests.append(if_none_match)
+                    snap = stub.snapshot
+                if snap is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                if snap.status != 200:
+                    self.send_response(snap.status)
+                    self.end_headers()
+                    return
+                if if_none_match == snap.etag:
+                    self.send_response(304)
+                    self.send_header("ETag", snap.etag)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("ETag", snap.etag)
+                self.send_header("X-Seestar-Stack-Frame", str(snap.stack_frame))
+                self.send_header("Content-Length", str(len(snap.body)))
+                self.end_headers()
+                self.wfile.write(snap.body)
+
             def log_message(self, *args):
                 pass
 
         self.requests: list[str] = []
+        self.snapshot_requests: list[str | None] = []
+        self.snapshot = snapshot
         self._lock = threading.Lock()
         self._stream = stream
         self._server = HTTPServer(("127.0.0.1", 0), Handler)
@@ -117,6 +155,16 @@ class _ImagingStub:
 
     def shutdown(self):
         self._server.shutdown()
+
+
+class _Snapshot:
+    """One scripted snapshot.jpg answer (status, ETag, stack-count header)."""
+
+    def __init__(self, *, stack_frame: int, etag: str = '"7"', status: int = 200):
+        self.stack_frame = stack_frame
+        self.etag = etag
+        self.status = status
+        self.body = _tiny_jpeg()
 
 
 class _FakeMqtt:
@@ -248,6 +296,7 @@ def test_live_camera_discovery_published_with_own_topic():
     assert cfg["name"] == "Live view"
     assert cfg["unique_id"] == f"{DEVICE_ID}_live_view"
     assert cfg["topic"] == f"seestar/{DEVICE_ID}/live"
+    assert cfg["json_attributes_topic"] == worker.live_attributes_topic
     # Its availability ANDs bridge liveness + scope reachability + OWNERSHIP.
     assert cfg["availability_mode"] == "all"
     topics = [entry["topic"] for entry in cfg["availability"]]
@@ -256,6 +305,31 @@ def test_live_camera_discovery_published_with_own_topic():
         worker.availability_topic,
         worker.live_availability_topic,
     ]
+
+
+def test_each_published_image_is_followed_by_a_new_version_attribute(monkeypatch):
+    # HA keeps the camera's entity_picture URL fixed when only the image
+    # changes; the version attribute (published AFTER the image) is what tells
+    # a dashboard to refetch. An unchanged snapshot (304) publishes neither.
+    stub = _ImagingStub(b"", snapshot=_Snapshot(stack_frame=150, etag='"7"'))
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr("seestar_bridge.scope.time.time", lambda: clock["now"])
+    try:
+        worker = _worker(stub.port, event_state=EVENT_STACKING)
+        _see_stack_progress(worker, monkeypatch)
+        _run_one_cycle(worker, monkeypatch)
+        stub.snapshot = _Snapshot(stack_frame=150, etag='"8"')
+        clock["now"] += 60
+        _run_one_cycle(worker, monkeypatch)
+        _run_one_cycle(worker, monkeypatch)  # unchanged: 304
+    finally:
+        stub.shutdown()
+    live = [t for t, _p, _r in worker._mqtt.published
+            if t in (worker.live_topic, worker.live_attributes_topic)]
+    assert live == [worker.live_topic, worker.live_attributes_topic] * 2
+    versions = [json.loads(p)["image_updated"]
+                for p in worker._mqtt.payloads(worker.live_attributes_topic)]
+    assert versions == [1_000_000, 1_060_000]
 
 
 def test_phase1_preview_camera_is_untouched_and_independent():
@@ -281,31 +355,243 @@ def test_discovery_seeds_live_availability_offline_retained():
     assert seeded == [("offline", True)]
 
 
-# -- (a) not owned: never polls the imaging port, live reads offline ---------------
+# -- (a) no active session: never polls the imaging port, live reads offline -------
 
-def test_not_owned_never_contacts_imaging_port_and_reads_offline(monkeypatch):
+@pytest.mark.parametrize("event_state", [
+    EVENT_VIEW_ENDED,
+    {"View": {"state": "complete"}},
+    {"PiStatus": {"temp": 20.0}},  # no View block at all (driver restarted)
+])
+def test_no_active_session_never_contacts_imaging_port_and_reads_offline(
+        monkeypatch, event_state):
     stub = _ImagingStub(_stream(_part("image/jpeg", _tiny_jpeg())))
     try:
-        worker = _worker(stub.port)
+        worker = _worker(stub.port, event_state=event_state)
         _run_one_cycle(worker, monkeypatch)
     finally:
         stub.shutdown()
-    assert stub.request_count() == 0  # firmware boundary: a non-owner never polls
+    assert stub.request_count() == 0  # /vid would serve only a stale image + Idle
     assert worker._mqtt.payloads(worker.live_availability_topic)[-1] == "offline"
     assert worker._mqtt.payloads(worker.live_topic) == []
 
 
 def test_refused_session_start_takes_no_ownership(monkeypatch):
     # Gate closed (not armed): the start command is REFUSED, so ownership must
-    # not flip and the imaging port stays untouched.
+    # not flip and, with no session active, the imaging port stays untouched.
     stub = _ImagingStub(_stream(_part("image/jpeg", _tiny_jpeg())))
     try:
-        worker = _worker(stub.port)
+        worker = _worker(stub.port, event_state=EVENT_VIEW_ENDED)
         worker.handle_command(_cmd_topic("start_stack"), "PRESS")  # refused
         _run_one_cycle(worker, monkeypatch)
     finally:
         stub.shutdown()
+    assert worker.session_owned is False
     assert stub.request_count() == 0
+    assert worker._mqtt.payloads(worker.live_availability_topic)[-1] == "offline"
+
+
+# -- (a2) a stack in progress, whoever started it, is served from the snapshot -----
+
+def _stack_event(stacked, *, dropped=10, view_state="working"):
+    """A deep-sky stack: star View plus the Stack block's frame counts."""
+    return {
+        "View": {"target_name": "M31", "state": view_state, "mode": "star"},
+        "Stack": {"stacked_frame": stacked, "dropped_frame": dropped},
+    }
+
+
+#: A deep-sky stack at 140 stacked + 10 dropped.
+EVENT_STACKING = _stack_event(140)
+
+
+def _see_stack_progress(worker, monkeypatch, stacked=140):
+    """One baseline cycle at ``stacked - 1``, then the count moves to
+    ``stacked``: the next cycle sees a stack in progress."""
+    worker._alpaca.event_state = _stack_event(stacked - 1)
+    _run_one_cycle(worker, monkeypatch)
+    worker._alpaca.event_state = _stack_event(stacked)
+
+
+def test_first_stack_count_seen_is_only_a_baseline(monkeypatch):
+    # A bridge (re)start mid-stack sees one count: no progress yet, so an
+    # unowned stack is not followed until the count actually moves.
+    stub = _ImagingStub(b"", snapshot=_Snapshot(stack_frame=150))
+    try:
+        worker = _worker(stub.port, event_state=EVENT_STACKING)
+        _run_one_cycle(worker, monkeypatch)
+    finally:
+        stub.shutdown()
+    assert stub.snapshot_requests == []
+    assert worker._mqtt.payloads(worker.live_availability_topic)[-1] == "offline"
+
+
+def test_unowned_stack_follows_the_snapshot_until_the_view_ends(monkeypatch):
+    # A stack started from the Seestar app: the bridge dispatched nothing, but
+    # it sees the count move, so the camera publishes the cached stack
+    # snapshot — never opening /vid — until the View ends.
+    stub = _ImagingStub(_stream(_part("image/jpeg", _tiny_jpeg())),
+                        snapshot=_Snapshot(stack_frame=150))
+    try:
+        worker = _worker(stub.port, event_state=EVENT_STACKING)
+        _see_stack_progress(worker, monkeypatch)
+        _run_one_cycle(worker, monkeypatch)
+        assert worker.session_owned is False
+        assert worker._mqtt.payloads(worker.live_topic)[-1][:2] == b"\xff\xd8"
+        assert worker._mqtt.payloads(worker.live_availability_topic)[-1] == "online"
+
+        worker._alpaca.event_state = _stack_event(140, view_state="cancel")
+        _run_one_cycle(worker, monkeypatch)
+    finally:
+        stub.shutdown()
+    assert stub.request_count() == 0         # /vid never opened for the stack
+    assert len(stub.snapshot_requests) == 1  # the ended cycle never polled
+    assert worker._mqtt.payloads(worker.live_availability_topic)[-1] == "offline"
+
+
+def test_a_stack_that_stops_progressing_goes_offline(monkeypatch):
+    stub = _ImagingStub(b"", snapshot=_Snapshot(stack_frame=150))
+    clock = {"now": 1000.0}
+    monkeypatch.setattr("seestar_bridge.scope.time.monotonic", lambda: clock["now"])
+    try:
+        worker = _worker(stub.port, event_state=EVENT_STACKING)
+        _see_stack_progress(worker, monkeypatch)
+        _run_one_cycle(worker, monkeypatch)
+        assert worker._mqtt.payloads(worker.live_availability_topic)[-1] == "online"
+
+        clock["now"] += scope_mod._MIN_STACK_FRESH_SEC + 1  # no new sub-frame
+        _run_one_cycle(worker, monkeypatch)
+    finally:
+        stub.shutdown()
+    assert len(stub.snapshot_requests) == 1
+    assert worker._mqtt.payloads(worker.live_availability_topic)[-1] == "offline"
+
+
+def test_unchanged_snapshot_costs_a_304_and_stays_online(monkeypatch):
+    stub = _ImagingStub(b"", snapshot=_Snapshot(stack_frame=150, etag='"7"'))
+    try:
+        worker = _worker(stub.port, event_state=EVENT_STACKING)
+        _see_stack_progress(worker, monkeypatch)
+        _run_cycles(worker, monkeypatch, 2)
+    finally:
+        stub.shutdown()
+    assert stub.snapshot_requests == [None, '"7"']
+    assert len(worker._mqtt.payloads(worker.live_topic)) == 1  # published once
+    assert worker._mqtt.payloads(worker.live_availability_topic)[-2:] == [
+        "online", "online"]
+
+
+def test_snapshot_from_a_previous_stack_is_rejected(monkeypatch):
+    # A new stack (count 5) while seestar_alp still holds the last session's
+    # image (count 287): never show the old stack as the current one.
+    stub = _ImagingStub(b"", snapshot=_Snapshot(stack_frame=287))
+    try:
+        worker = _worker(stub.port, event_state=EVENT_STACKING)
+        _see_stack_progress(worker, monkeypatch, stacked=5)
+        worker._alpaca.event_state = _stack_event(5, dropped=0)
+        _run_one_cycle(worker, monkeypatch)
+    finally:
+        stub.shutdown()
+    assert len(stub.snapshot_requests) == 1
+    assert worker._mqtt.payloads(worker.live_topic) == []
+    assert worker._mqtt.payloads(worker.live_availability_topic)[-1] == "offline"
+
+
+@pytest.mark.parametrize("snapshot", [None, _Snapshot(stack_frame=150, status=503)])
+def test_unowned_stack_without_a_snapshot_reads_offline_and_never_opens_vid(
+        monkeypatch, snapshot):
+    # No snapshot endpoint (an older seestar_alp) or no image held yet: offline,
+    # and an unowned stack never falls back to /vid.
+    stub = _ImagingStub(_stream(_part("image/jpeg", _tiny_jpeg())), snapshot=snapshot)
+    try:
+        worker = _worker(stub.port, event_state=EVENT_STACKING)
+        _see_stack_progress(worker, monkeypatch)
+        _run_one_cycle(worker, monkeypatch)
+    finally:
+        stub.shutdown()
+    assert stub.request_count() == 0
+    assert worker._mqtt.payloads(worker.live_availability_topic)[-1] == "offline"
+
+
+def test_owned_stack_uses_the_snapshot_not_vid(monkeypatch):
+    stub = _ImagingStub(_stream(_part("image/jpeg", _tiny_jpeg())),
+                        snapshot=_Snapshot(stack_frame=150))
+    try:
+        worker = _worker(stub.port, event_state=EVENT_STACKING)
+        _start_session(worker)
+        _see_stack_progress(worker, monkeypatch)
+        _run_one_cycle(worker, monkeypatch)
+    finally:
+        stub.shutdown()
+    assert stub.request_count() == 0
+    assert worker._mqtt.payloads(worker.live_availability_topic)[-1] == "online"
+
+
+def test_owned_star_session_before_stacking_never_opens_vid(monkeypatch):
+    # An owned deep-sky session that is not stacking yet (slewing, plate
+    # solving): /vid would run the heavy stack generator, so nothing is polled.
+    stub = _ImagingStub(_stream(_part("image/jpeg", _tiny_jpeg())),
+                        snapshot=_Snapshot(stack_frame=150))
+    try:
+        worker = _worker(stub.port, event_state={
+            "View": {"target_name": "M31", "state": "working", "mode": "star"}})
+        _start_session(worker)
+        _run_one_cycle(worker, monkeypatch)
+    finally:
+        stub.shutdown()
+    assert stub.request_count() == 0
+    assert stub.snapshot_requests == []
+    assert worker._mqtt.payloads(worker.live_availability_topic)[-1] == "offline"
+
+
+_EVENT_PLANET_WORKING = {"View": {"state": "working", "mode": "planet"}}
+
+
+def test_owned_video_mode_session_grabs_vid(monkeypatch):
+    stub = _ImagingStub(_stream(_part("image/jpeg", _tiny_jpeg())),
+                        snapshot=_Snapshot(stack_frame=150))
+    try:
+        worker = _worker(stub.port, event_state=_EVENT_PLANET_WORKING)
+        _start_session(worker)
+        _run_one_cycle(worker, monkeypatch)
+    finally:
+        stub.shutdown()
+    assert stub.request_count() == 1
+    assert stub.snapshot_requests == []
+    assert worker._mqtt.payloads(worker.live_availability_topic)[-1] == "online"
+
+
+def test_unowned_video_mode_session_is_not_polled(monkeypatch):
+    stub = _ImagingStub(_stream(_part("image/jpeg", _tiny_jpeg())),
+                        snapshot=_Snapshot(stack_frame=150))
+    try:
+        worker = _worker(stub.port, event_state=_EVENT_PLANET_WORKING)
+        _run_one_cycle(worker, monkeypatch)
+    finally:
+        stub.shutdown()
+    assert stub.request_count() == 0
+    assert stub.snapshot_requests == []
+    assert worker._mqtt.payloads(worker.live_availability_topic)[-1] == "offline"
+
+
+def test_unreachable_scope_stops_following_an_observed_stack(monkeypatch):
+    # An event-poll failure says nothing about the stack: earlier progress must
+    # not keep the imaging server polled while the scope is unreachable.
+    stub = _ImagingStub(b"", snapshot=_Snapshot(stack_frame=150))
+    try:
+        worker = _worker(stub.port, event_state=EVENT_STACKING)
+        _see_stack_progress(worker, monkeypatch)
+        _run_one_cycle(worker, monkeypatch)
+        assert len(stub.snapshot_requests) == 1
+
+        def _fail(name, params=None):
+            raise RuntimeError("event poll failed")
+
+        monkeypatch.setattr(worker._alpaca, "action", _fail)
+        monkeypatch.setattr(worker._alpaca, "is_connected", lambda timeout=None: False)
+        _run_one_cycle(worker, monkeypatch)
+    finally:
+        stub.shutdown()
+    assert len(stub.snapshot_requests) == 1
     assert worker._mqtt.payloads(worker.live_availability_topic)[-1] == "offline"
 
 
@@ -358,6 +644,7 @@ def test_stop_ok_clears_ownership_and_live_goes_offline(monkeypatch):
 
         worker.handle_command(_cmd_topic("stop"), "PRESS")
         assert worker.session_owned is False
+        worker._alpaca.event_state = EVENT_VIEW_ENDED  # the scope stopped too
         _run_one_cycle(worker, monkeypatch)
     finally:
         stub.shutdown()

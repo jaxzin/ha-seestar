@@ -15,8 +15,9 @@ process can drive a distinct HA device per scope.
 ``event_poll_sec``; probe ``get_device_state`` on a slow cadence with the
 Phase-1 exponential backoff (it only answers when the scope is briefly idle);
 fetch + downscale the saved stack preview whenever a new ``SaveImage`` lands;
-grab one live ``/vid`` frame per cycle while THIS bridge owns the session (see
-the ownership notes on :meth:`ScopeWorker._track_session_ownership`); and
+grab one live ``/vid`` frame per cycle while a session is active — one THIS
+bridge started, or one it observes in the event stream, such as a stack started
+from the Seestar app (see :meth:`ScopeWorker._maybe_publish_live`); and
 publish the per-scope availability ('online' only when the scope is actually
 reachable) + the state JSON each cycle. The state JSON is a LAST-KNOWN merged
 snapshot (seeded from the bridge's own retained topic at startup), so neither
@@ -152,13 +153,19 @@ _CAMERA_COMPONENT = "camera"
 _CAMERA_KEY = "preview"
 _CAMERA_NAME = "Live stacked preview"
 
-#: Phase-2 live camera: fed from seestar_alp's imaging server ``/vid`` MJPEG
-#: stream, published on its OWN sub-topic (``seestar/<device>/live``) with its
-#: OWN availability topic underneath it, so the not-owned state can gray out
-#: the live camera without touching the Phase-1 saved-stack preview.
+#: Phase-2 live camera: the stack in progress (seestar_alp's snapshot) or a
+#: video session (/vid), published on its OWN sub-topic
+#: (``seestar/<device>/live``) with its OWN availability topic underneath it,
+#: so no-active-session can gray out the live camera without touching the
+#: Phase-1 saved-stack preview.
 _LIVE_CAMERA_KEY = "live_view"
 _LIVE_CAMERA_NAME = "Live view"
 _LIVE_SUBTOPIC = "live"
+
+#: The live camera's attributes sub-topic and its per-image version key (epoch
+#: ms of the publish), so dashboards can refetch the image when it changes.
+_ATTRIBUTES_SUBTOPIC = "attributes"
+_IMAGE_UPDATED_ATTR = "image_updated"
 
 #: Discovery component for the ad-hoc last-command-result sensor (published
 #: directly here, like the camera, because its state topic is not the shared
@@ -207,13 +214,25 @@ _STATEFUL_DISPATCH_COMPONENTS = frozenset({
     control.COMPONENT_TEXT,
 })
 
-# --- session ownership (gates the live camera) -----------------------------------
+# --- session ownership + observed stacks (gate the live camera) -----------------
 #
-# seestar_alp's :7556/vid MJPEG stream only serves real frames to the client
-# that OWNS the imaging session; a passive observer receives an Idle
-# placeholder. That firmware boundary is surfaced, not worked around: the live
-# camera only polls the stream while THIS bridge owns the session, i.e. after a
-# session-starting command dispatched OK through the bridge's own command path.
+# The live camera has two image sources on seestar_alp's imaging server:
+#
+# - ``/<dev>/snapshot.jpg`` (the jaxzin/seestar_alp fork): the latest
+#   stacked-image REPLY as one cached JPEG, bound on arrival to its stack
+#   count. Used for every stack in progress, whoever started it: a stack
+#   started from the Seestar app included. "In progress" is judged by the
+#   bridge itself — the stack count advanced between its own polls — not by
+#   the View block, which seestar_alp only fills when a View event arrives
+#   (it is absent for the rest of a session after a driver restart), and
+#   which reads 'working' through a new session's pre-stack phase, when the
+#   only image on hand is still the previous stack's.
+# - ``/<dev>/vid``: an endless MJPEG generator per request. Kept only for
+#   video-mode sessions (sun/moon/planet/scenery) this bridge started, and for
+#   an owned stack on a seestar_alp without the snapshot endpoint. Never used
+#   for a stack otherwise: each short grab leaves a generator re-stretching the
+#   full stack until the next sub-frame, and repeated grabs exhausted the HA
+#   host's memory (OOM kill of seestar_alp, 2026-11-10).
 
 #: Dispatch-catalog keys whose OK dispatch makes seestar_alp (and therefore this
 #: bridge) the owning client. Verified against seestar_alp: start_live_view is
@@ -248,6 +267,16 @@ _VIEW_ENDED_STATES = frozenset({"complete", "fail", "cancel"})
 #: while the scheduler is working.
 _SCHEDULER_EVENT_KEY = "scheduler"
 _SCHEDULER_WORKING_STATE = "working"
+
+#: The View ``mode`` of a deep-sky session: never served from /vid (see the
+#: session notes above), even when this bridge owns it.
+_STACKING_VIEW_MODE = "star"
+
+#: A stack counts as in progress for this many sub-exposures after its count
+#: last changed (one changes per sub-frame, stacked or dropped)...
+_STACK_FRESH_EXPOSURES = 3
+#: ...but never less than this, which also covers an unknown exposure.
+_MIN_STACK_FRESH_SEC = 120
 
 #: Stuck-ownership staleness bound: a driver restart wipes its event_state, and
 #: an owned session ALWAYS carries a View block — so this many CONSECUTIVE
@@ -288,6 +317,21 @@ _MJPEG_BOUNDARY = b"--frame"
 _MJPEG_HEADER_END = b"\r\n\r\n"
 _MJPEG_JPEG_CONTENT_TYPE = b"image/jpeg"
 _MJPEG_CHUNK_BYTES = 64 * 1024
+
+#: seestar_alp fork's cached stacked-image endpoint (see the session notes
+#: above). It answers 200 with ETag + the stack-count header, 304 for a
+#: matching If-None-Match, 503 while it holds no image, and 404 on a
+#: seestar_alp without the endpoint.
+_SNAPSHOT_PATH = "snapshot.jpg"
+_SNAPSHOT_STACK_FRAME_HEADER = "X-Seestar-Stack-Frame"
+_HTTP_NOT_MODIFIED = 304
+_HTTP_NOT_FOUND = 404
+
+#: Outcomes of one snapshot poll.
+_SNAP_NEW = "new"                  # a new image of the current stack
+_SNAP_UNCHANGED = "unchanged"      # the image already published is still current
+_SNAP_NONE = "none"                # no image of the current stack (yet)
+_SNAP_UNSUPPORTED = "unsupported"  # seestar_alp has no snapshot endpoint
 
 #: Hard cap on the preview body we fetch + decode. The scope's stacked .jpg is a
 #: few MiB; anything over this is either not the file we expect or an attempt to
@@ -392,7 +436,8 @@ class ScopeWorker:
         # are isolated per worker, so arming one scope never arms another.
         self._controls_enabled = False
         self._allow_power = False
-        # Session ownership (gates the live camera; see the _SESSION_* constants).
+        # Session ownership (one of the two live-camera gates; see the
+        # _SESSION_* constants and _maybe_publish_live).
         # Written by paho's command thread (_track_session_ownership) and by the
         # poll thread (_refresh_session_ownership), read by the poll thread every
         # cycle — so all access goes through the lock, never the bare attribute.
@@ -406,6 +451,19 @@ class ScopeWorker:
         self._session_confirmed = False
         self._polls_without_view = 0
         self._session_lock = threading.Lock()
+        # The other live-camera gate: a stack in progress, whoever started it
+        # (e.g. the Seestar app). This cycle's View mode and stack count
+        # (stacked + dropped), from the same event snapshot, plus when the
+        # bridge last SAW that count change (the first count seen is only a
+        # baseline, never progress). Poll-thread only, so no lock.
+        self._view_mode: str | None = None
+        self._view_ended = False
+        self._stack_frame: int | None = None
+        self._stack_frame_seen: int | None = None
+        self._stack_changed_at: float | None = None
+        # ETag of the snapshot last published to the live camera, so an
+        # unchanged image costs a 304; cleared whenever the camera goes offline.
+        self._live_snapshot_etag: str | None = None
         # Value-only stored inputs (imaging mode; goto target/RA/Dec): updated by
         # their command topics WITHOUT any Alpaca call, consumed by the trigger
         # buttons' dispatch. Imaging mode starts at the documented default.
@@ -459,6 +517,16 @@ class ScopeWorker:
     def live_availability_topic(self) -> str:
         """The live camera's OWN availability topic: ``offline`` when not owned."""
         return f"{self.live_topic}/{_AVAILABILITY_SUBTOPIC}"
+
+    @property
+    def live_attributes_topic(self) -> str:
+        """The live camera's attributes: an ``image_updated`` version per image.
+
+        HA keeps a camera's ``entity_picture`` URL fixed when only its image
+        changes, so a dashboard can't tell a new frame arrived. This attribute,
+        published right after each image, changes the entity state with it.
+        """
+        return f"{self.live_topic}/{_ATTRIBUTES_SUBTOPIC}"
 
     @property
     def command_result_topic(self) -> str:
@@ -733,15 +801,16 @@ class ScopeWorker:
         }
         camera_topic = f"{prefix}/{_CAMERA_COMPONENT}/{self._device_id}/{_CAMERA_KEY}/config"
         self._mqtt.publish(camera_topic, json.dumps(camera), retain=True)
-        # Phase-2 live camera: its availability list ADDS its own ownership
-        # topic to the shared bridge + scope pair, so HA grays it out whenever
-        # this bridge does not own the session (the :7556/vid firmware boundary)
-        # while the Phase-1 saved-stack preview above stays independent.
+        # Phase-2 live camera: its availability list ADDS its own topic to the
+        # shared bridge + scope pair, so HA grays it out whenever no session is
+        # active (/vid then serves no live frames), while the Phase-1
+        # saved-stack preview above stays independent.
         live_camera = {
             "name": _LIVE_CAMERA_NAME,
             "unique_id": f"{self._device_id}_{_LIVE_CAMERA_KEY}",
             "object_id": f"{self._device_id}_{_LIVE_CAMERA_KEY}",
             "topic": self.live_topic,
+            "json_attributes_topic": self.live_attributes_topic,
             "availability": availability_list(
                 self._bridge_availability_topic, self.availability_topic,
                 self.live_availability_topic),
@@ -751,8 +820,8 @@ class ScopeWorker:
         live_camera_topic = (
             f"{prefix}/{_CAMERA_COMPONENT}/{self._device_id}/{_LIVE_CAMERA_KEY}/config")
         self._mqtt.publish(live_camera_topic, json.dumps(live_camera), retain=True)
-        # Seed the live camera unavailable (retained): a cold-started bridge
-        # owns no session, and HA must render that as offline, not 'unknown'.
+        # Seed the live camera unavailable (retained): a cold-started bridge has
+        # seen no active session, and HA must render that as offline, not 'unknown'.
         self._publish_live_availability(False)
         # Operator-visible dispatch outcome: a plain sensor fed by the per-scope
         # command_result topic, so a REFUSED/ERROR command shows up in HA (with
@@ -1140,8 +1209,8 @@ class ScopeWorker:
 
     # -- live /vid camera ---------------------------------------------------------
 
-    def _imaging_stream_url(self) -> str:
-        """This scope's live MJPEG stream on seestar_alp's imaging server.
+    def _imaging_url(self, path: str) -> str:
+        """A path on this scope's seestar_alp imaging server.
 
         Derived from the Alpaca base's host (the imaging server always runs
         beside the Alpaca endpoint) plus the ``imaging_port`` setting (default
@@ -1149,7 +1218,54 @@ class ScopeWorker:
         """
         host = urllib.parse.urlsplit(self._settings.alpaca_base).hostname
         return (f"http://{host}:{self._settings.imaging_port}"
-                f"/{self._device_num}/{_LIVE_STREAM_PATH}")
+                f"/{self._device_num}/{path}")
+
+    def _imaging_stream_url(self) -> str:
+        """This scope's live MJPEG stream on seestar_alp's imaging server."""
+        return self._imaging_url(_LIVE_STREAM_PATH)
+
+    def grab_stack_snapshot(self) -> tuple[str, bytes | None]:
+        """Poll seestar_alp's cached stacked image once; ``(outcome, jpeg)``.
+
+        Only an image of THIS cycle's stack is accepted: its stack-count header
+        must be in ``1..current count``, which rejects a stale image left from
+        a previous session (a higher count) while it waits for the new stack.
+        An unchanged image (304 on the ETag of the last published one) costs
+        no body. The accepted JPEG is downscaled like the saved preview.
+        """
+        request = urllib.request.Request(self._imaging_url(_SNAPSHOT_PATH))
+        if self._live_snapshot_etag:
+            request.add_header("If-None-Match", self._live_snapshot_etag)
+        try:
+            with urllib.request.urlopen(request, timeout=_LIVE_GRAB_TIMEOUT_SEC) as resp:
+                etag = resp.headers.get("ETag")
+                tagged = resp.headers.get(_SNAPSHOT_STACK_FRAME_HEADER)
+                if not self._snapshot_is_current_stack(tagged):
+                    return _SNAP_NONE, None
+                raw = resp.read(_MAX_PREVIEW_BYTES + 1)
+        except urllib.error.HTTPError as exc:
+            if exc.code == _HTTP_NOT_MODIFIED:
+                return _SNAP_UNCHANGED, None
+            if exc.code == _HTTP_NOT_FOUND:
+                return _SNAP_UNSUPPORTED, None
+            return _SNAP_NONE, None  # 503: no image held yet
+        if len(raw) > _MAX_PREVIEW_BYTES or raw[:len(_JPEG_MAGIC)] != _JPEG_MAGIC:
+            return _SNAP_NONE, None
+        frame = self._decode_preview(raw)
+        if frame is None:
+            return _SNAP_NONE, None
+        self._live_snapshot_etag = etag
+        return _SNAP_NEW, frame
+
+    def _snapshot_is_current_stack(self, tagged: str | None) -> bool:
+        """True when a snapshot's stack-count header belongs to this stack."""
+        if tagged is None or self._stack_frame is None:
+            return False
+        try:
+            count = int(tagged)
+        except ValueError:
+            return False
+        return 0 < count <= self._stack_frame
 
     def grab_live_frame(self) -> bytes | None:
         """Read ONE fresh JPEG out of the live MJPEG stream, downscaled.
@@ -1215,31 +1331,67 @@ class ScopeWorker:
                     and body[-len(_JPEG_END_MAGIC):] == _JPEG_END_MAGIC):
                 return body, buf
 
-    def _maybe_publish_live(self, reachable: bool) -> None:
-        """Publish one live frame + the live availability for this cycle.
+    def _stack_in_progress(self) -> bool:
+        """True while the stack count changed recently, as this bridge saw it,
+        and no View block says the session ended."""
+        if self._stack_changed_at is None or self._view_ended:
+            return False
+        exposure = self._published_state.get("exposure_s")
+        window = _MIN_STACK_FRESH_SEC
+        if isinstance(exposure, (int, float)):
+            window = max(window, exposure * _STACK_FRESH_EXPOSURES)
+        return time.monotonic() - self._stack_changed_at <= window
 
-        The live camera is HARD-GATED on session ownership: when this bridge
-        does not own the session (or the scope is unreachable this cycle) the
-        imaging port is NOT polled at all — a passive observer would only
-        receive the Idle placeholder (the firmware boundary; surfaced, not
-        worked around) — and the camera's own availability topic reads
-        ``offline``. When owned, ONE fresh frame is grabbed per poll cycle; a
-        grab failure is logged, marks just this cycle unavailable (ownership
-        is kept — the next cycle retries), and leaves the telemetry that was
-        already published this cycle untouched.
+    def _maybe_publish_live(self, reachable: bool) -> None:
+        """Publish the live camera's image + availability for this cycle.
+
+        The live camera is HARD-GATED on an active session: a stack in progress
+        (whoever started it, e.g. the Seestar app), or a session this bridge
+        owns. Otherwise — or when the scope is unreachable this cycle — the
+        imaging server is NOT contacted and the camera's own availability topic
+        reads ``offline``.
+
+        A stack in progress polls the cached snapshot: the camera is online
+        while the published image is the current stack's. A video-mode session
+        this bridge owns grabs one ``/vid`` frame, as does an owned stack on a
+        seestar_alp without the snapshot endpoint. A failure is logged and
+        marks just this cycle unavailable (ownership is kept — the next cycle
+        retries), leaving the telemetry already published this cycle untouched.
         """
-        if not (reachable and self.session_owned):
+        owned = self.session_owned
+        stacking = self._stack_in_progress()
+        if not (reachable and (owned or stacking)):
+            self._live_snapshot_etag = None
             self._publish_live_availability(False)
             return
+        frame = None
+        live = False
         try:
-            frame = self.grab_live_frame()
+            if stacking:
+                outcome, frame = self.grab_stack_snapshot()
+                live = outcome in (_SNAP_NEW, _SNAP_UNCHANGED)
+                if outcome == _SNAP_UNSUPPORTED and owned:
+                    frame = self.grab_live_frame()
+                    live = frame is not None
+            elif self._view_mode != _STACKING_VIEW_MODE:
+                frame = self.grab_live_frame()  # owned, not a stack: video mode
+                live = frame is not None
         except (*_PROBE_ERRORS, *_pillow_decode_errors()) as exc:
             _log.warning("%s: live frame grab failed; live view offline this cycle: %s",
                          self._device_id, exc)
             frame = None
+            live = False
         if frame:
             self._mqtt.publish(self.live_topic, frame, qos=0, retain=True)
-        self._publish_live_availability(frame is not None)
+            # After the image (same connection, so HA receives them in order):
+            # a new version tells dashboards to refetch the camera image.
+            self._mqtt.publish(
+                self.live_attributes_topic,
+                json.dumps({_IMAGE_UPDATED_ATTR: int(time.time() * 1000)}),
+                retain=True)
+        if not live:
+            self._live_snapshot_etag = None
+        self._publish_live_availability(live)
 
     def _publish_live_availability(self, available: bool) -> None:
         """Publish the live camera's own availability (retained) for this cycle."""
@@ -1367,7 +1519,7 @@ class ScopeWorker:
         :meth:`_seed_last_known_state` and the :data:`_CYCLE_FRESH_KEYS` block),
         so a driver restart's sparse events never blank the dashboard.
         The live camera piggybacks on the same cadence: one ``/vid`` frame per
-        cycle while the session is owned, its own availability otherwise (see
+        cycle while a session is active, its own availability otherwise (see
         :meth:`_maybe_publish_live`).
         """
         # Seed the last-known snapshot from our own retained state topic so an
@@ -1508,11 +1660,30 @@ class ScopeWorker:
             # RuntimeError covers an Alpaca-level error or an in-band seestar_alp
             # refusal; either way this cycle degrades to unreachable, not a crash.
             _log.warning("%s: event poll failed: %s", self._device_id, exc)
+            self._view_mode = None
+            self._view_ended = False
+            self._stack_frame = None
             return {}, None, False
         state = self.build_state(event_state if isinstance(event_state, dict) else {}, unix_t=now)
         # Confirm the owned-session flag against this same event snapshot (a
-        # View in a terminal state means the session ended out from under us).
+        # View in a terminal state means the session ended out from under us),
+        # and track the stack count for the live camera's stack-in-progress gate.
         self._refresh_session_ownership(event_state)
+        view_mode = _nav(event_state, "View", "mode")
+        self._view_mode = view_mode.lower() if isinstance(view_mode, str) else None
+        view_state = _nav(event_state, "View", "state")
+        self._view_ended = (isinstance(view_state, str)
+                            and view_state.lower() in _VIEW_ENDED_STATES)
+        stacked = _nav(event_state, "Stack", "stacked_frame")
+        dropped = _nav(event_state, "Stack", "dropped_frame")
+        self._stack_frame = (stacked + dropped
+                             if isinstance(stacked, int) and isinstance(dropped, int)
+                             else None)
+        if self._stack_frame is not None:
+            if (self._stack_frame_seen is not None
+                    and self._stack_frame != self._stack_frame_seen):
+                self._stack_changed_at = time.monotonic()
+            self._stack_frame_seen = self._stack_frame
         self._ensure_site_location_safe()
         if (self._site_lat is not None and state.get("ra") is not None
                 and "altitude" not in state):
