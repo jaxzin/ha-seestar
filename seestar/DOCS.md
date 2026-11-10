@@ -149,9 +149,10 @@ same scope: a Seestar serves its command channel to one client at a time.
 Per telescope, one HA device with ~46 telemetry entities, the Phase-2 control
 entities and their **Last command result** sensor
 (see [Controls (Phase 2)](#controls-phase-2)), plus two `camera` entities: the
-saved stacked preview, and a **Live view** camera fed from seestar_alp's `/vid`
-stream — live only for sessions started from Home Assistant
-(see [Live view camera](#live-view-camera)). Telemetry entities:
+saved stacked preview, and a **Live view** camera fed from seestar_alp's
+imaging server — live while a stack is in progress or a session started from
+Home Assistant is active (see [Live view camera](#live-view-camera)).
+Telemetry entities:
 
 - **Cameras**: telephoto (cam 0) and wide-field (cam 1) target / state / mode /
   gain / LP-filter, plus the active camera.
@@ -220,7 +221,7 @@ another.
 | **Controls enabled** (switch) | Master safety gate for every command. | Default OFF — nothing dispatches while off. |
 | **Allow power actions** (switch) | Second gate for Startup sequence / Park / Shutdown. | Default OFF — both switches must be on for power actions. |
 | **Imaging mode** (select) | Chooses the mode (`star` / `scenery` / `planet` / `sun` / `moon`) that **Start live view** will use. | **Value-only**: changing it does nothing until *Start live view* is pressed. Defaults to `star`. |
-| **Start live view** (button) | Starts an imaging session in the selected imaging mode. | Makes this bridge the session's owning client, which is what turns the [Live view camera](#live-view-camera) on. |
+| **Start live view** (button) | Starts an imaging session in the selected imaging mode. | Makes this bridge the session's owning client; the [Live view camera](#live-view-camera) follows the session. |
 | **Start stacking** (button) | Starts (restarts) stacking on the current target. | Also starts an HA-owned session. |
 | **Stop** (button) | Stops the running scheduler session. | Only stops scheduler-driven sessions — see [Rough edges](#rough-edges). |
 | **Start mosaic** (button) | Starts a mosaic capture. | |
@@ -251,15 +252,23 @@ another.
 
 ### Live view camera
 
-The **Live view** camera shows seestar_alp's real-time `/vid` stacking stream —
-but **only while the imaging session was started from Home Assistant** (via
-*Start live view*, *Start stacking*, *Goto*, *Run plan*, *Start mosaic*, or
-*Start spectra*). The scope's firmware serves
-live frames only to the session's **owning client**; when this bridge starts the
-session, it is that owner. A session started from the phone app belongs to the
-phone, so the camera reads **unavailable** and you get only the saved-stack
-**Live stacked preview** — that is a firmware boundary the bridge surfaces
-rather than works around, and the saved-stack preview keeps working
+The **Live view** camera shows what the scope is doing right now:
+
+- **A stack in progress** — whoever started it, the Seestar phone app included
+  — shows the stack as it builds. The bridge reads seestar_alp's cached
+  `snapshot.jpg` (one JPEG per new sub-frame) and treats a stack as in
+  progress while its frame count keeps changing between polls. It needs a
+  seestar_alp with that endpoint (the Seestar Alpaca driver add-on from
+  [jaxzin/ha_seestar_alp](https://github.com/jaxzin/ha_seestar_alp)); with an
+  older seestar_alp only stacks started from Home Assistant are shown.
+- **A planetary, solar, lunar or scenery session started from Home Assistant**
+  (*Start live view*, *Goto*, *Run plan*, …) shows seestar_alp's real-time
+  `/vid` stream.
+
+Otherwise the camera reads **unavailable**. After an app restart, or once a
+stack stops gaining frames, it waits for the next sub-frame (about one exposure)
+before showing the stack again, so it never presents an earlier stack as the
+current one. The saved-stack **Live stacked preview** keeps working
 independently either way.
 
 ### Rough edges
@@ -288,11 +297,11 @@ against seestar_alp:
   while busy). The bridge detects that shape and publishes it as `error: …` on
   the **Last command result** sensor — the command reached the driver, but the
   scope said no.
-- **Restarting the app mid-session turns the Live view camera off.** Session
-  ownership lives in the bridge's memory, so an app restart during an
-  HA-started session forgets that HA owns it: telemetry and the saved-stack
-  preview keep working, but the **Live view** camera stays unavailable until
-  the **next** session started from Home Assistant.
+- **Restarting the app mid-session pauses the Live view camera for up to one
+  sub-exposure.** The bridge only treats a stack as in progress after it has
+  seen the frame count change itself, and session ownership lives in the
+  bridge's memory, so an HA-started planetary session's live view stays
+  unavailable until the next session started from Home Assistant.
 - **Mount mode updates instantly only on drivers that publish the
   `get_event_state` mount block** (the seestar_alp fork, or an upstream release
   containing [PR #750](https://github.com/smart-underworld/seestar_alp/pull/750));

@@ -30,6 +30,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every MQTT connect **and reconnect**, not only at startup. Previously a broker
   blip left the Last-Will `offline` retained, greying out every control entity
   until the add-on restarted.
+- The **Live view** camera now shows a stack in progress whoever started it,
+  such as a stack started from the Seestar phone app, using seestar_alp's
+  cached `snapshot.jpg` endpoint instead of the `/vid` stream. A stack is in
+  progress while its frame count keeps changing between the bridge's polls;
+  an image from an earlier stack is never shown as the current one. Stacks no
+  longer touch `/vid`: grabbing single frames from it left seestar_alp running
+  one full-resolution processing loop per grab until the next sub-frame, which
+  exhausted a Home Assistant host's memory. The camera also carries an
+  `image_updated` attribute that changes with every new image, so dashboards
+  (such as the Seestar Card) can refetch it; HA keeps the camera's
+  `entity_picture` URL unchanged when only the image changes.
 
 ### Changed (breaking)
 
